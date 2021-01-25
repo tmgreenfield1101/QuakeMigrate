@@ -131,6 +131,15 @@ class Archive:
         self.pre_filt = response_removal_params.get("pre_filt")
         self.remove_full_response = \
             response_removal_params.get("remove_full_response", False)
+        self.waveform_merge_method = kwargs.get('merge_method', -1)
+        if self.waveform_merge_method == 0:
+            msg = ("You should not choose merge_method=0 as it will lead"
+                    " to masked arrays (bad)")
+            raise AttributeError(msg)
+        self.waveform_merge_interp_samples = kwargs.get('merge_interp_smpl', -1)
+        self.waveform_merge_fill_value = kwargs.get('merge_fill', 'interpolate')
+        self.waveform_merge_max_gap = kwargs.get('merge_max_gap', 1.) # as a % of the requested data
+
 
     def __str__(self, response_only=False):
         """
@@ -215,6 +224,33 @@ class Archive:
         else:
             raise util.ArchivePathStructureError(archive_format)
 
+    def merge_waveforms(self, stream):
+        # get list of stations
+        stations = list(set([trace.stats.station for trace in stream]))
+        out = Stream()
+        for station in stations:
+            tmp = stream.select(station=station)
+            gaps = tmp.get_gaps()
+
+            if len(gaps) == 0:
+                tmp.merge(method=self.waveform_merge_method,
+                        interpolation_samples=self.waveform_merge_interp_samples,
+                        fill_value=self.waveform_merge_fill_value)
+                out += tmp
+                continue
+
+            for gap in gaps:
+                ttmp = stream.select(network=gap[0], station=gap[1],
+                                    location=gap[2], channel=gap[3])
+                if gap[6] < self.waveform_merge_max_gap:
+                    ttmp.merge(method=self.waveform_merge_method,
+                        interpolation_samples=self.waveform_merge_interp_samples,
+                        fill_value=self.waveform_merge_fill_value)
+
+                out += ttmp
+
+        return out
+
     def read_waveform_data(self, starttime, endtime, pre_pad=0., post_pad=0.):
         """
         Read in waveform data from the archive between two times.
@@ -279,7 +315,10 @@ class Archive:
 
             # Merge all traces with contiguous data, or overlapping data which
             # exactly matches (== st._cleanup(); i.e. no clobber)
-            st.merge(method=-1)
+            if self.waveform_merge_method == -1:
+                st.merge(method=self.waveform_merge_method)
+            else:
+                st = self.merge_waveforms(st)
 
             # Make copy of raw waveforms to output if requested
             data.raw_waveforms = st.copy()
