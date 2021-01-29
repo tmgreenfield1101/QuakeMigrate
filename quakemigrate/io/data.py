@@ -718,22 +718,45 @@ class WaveformData:
             # not account for the effect of the digital FIR filters applied to
             # the recorded waveforms. However, due to this it is significantly
             # faster to compute.
-            try:
-                response = self.response_inv.get_response(tr.id,
-                                                          tr.stats.starttime)
-            except Exception as e:
-                raise util.ResponseNotFoundError(str(e), tr.id)
+            if type(self.response_inv) == dict:
+                # each station has an individual response held in a dict
+                # this allows for the inclusion of SACPZ
+                resp = self.response_inv[tr.stats.station]
+                if type(resp) == dict:
+                    # sac pz
+                    paz_dict = resp
+                else:
+                    # inventory
+                    try:
+                        response = self.response_inv[tr.stats.station].get_response(tr.id,
+                                                                tr.stats.starttime)
+                    except Exception as e:
+                        raise util.ResponseNotFoundError(str(e), tr.id)
 
-            # Get the instrument transfer function as a PAZ dictionary
-            paz = response.get_paz()
+                    # Get the instrument transfer function as a PAZ dictionary
+                    paz = response.get_paz()
 
-            if not velocity:
-                paz.zeros.extend([0j])
+                    paz_dict = {'poles': paz.poles,
+                                'zeros': paz.zeros,
+                                'gain': paz.normalization_factor,
+                                'sensitivity': response.instrument_sensitivity.value}
+            else: 
+                try:
+                    response = self.response_inv.get_response(tr.id,
+                                                            tr.stats.starttime)
+                except Exception as e:
+                    raise util.ResponseNotFoundError(str(e), tr.id)
 
-            paz_dict = {'poles': paz.poles,
-                        'zeros': paz.zeros,
-                        'gain': paz.normalization_factor,
-                        'sensitivity': response.instrument_sensitivity.value}
+                # Get the instrument transfer function as a PAZ dictionary
+                paz = response.get_paz()
+
+                if not velocity:
+                    paz.zeros.extend([0j])
+
+                paz_dict = {'poles': paz.poles,
+                            'zeros': paz.zeros,
+                            'gain': paz.normalization_factor,
+                            'sensitivity': response.instrument_sensitivity.value}
 
             try:
                 tr.simulate(paz_remove=paz_dict,

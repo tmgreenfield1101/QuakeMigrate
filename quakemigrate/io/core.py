@@ -130,8 +130,7 @@ def read_response_inv(response_file, sac_pz_format=False):
     """
 
     if sac_pz_format:
-        raise NotImplementedError("SAC_PZ is not yet supported. Please contact "
-                                  "the QuakeMigrate developers.")
+        response_inv = read_sac_pz(response_file)
     else:
         try:
             response_inv = read_inventory(response_file)
@@ -142,6 +141,40 @@ def read_response_inv(response_file, sac_pz_format=False):
 
     return response_inv
 
+def read_sac_pz(filename):
+    with open(filename, 'r') as fid:
+        lines = [line.split() for line in fid.readlines()]
+    poles, zeros, constant = [], [], 0.
+    nlines = len(lines)
+    i = 0
+    while i < nlines:
+        if lines[i][0] == 'ZEROS':
+            nzeros = int(lines[i][1])
+            j = 0
+            i += 1
+            while j < nzeros:
+                zeros.append(float(lines[i][0]) + float(lines[i][1])*1j)
+                j += 1
+                i += 1
+        if lines[i][0] == 'POLES':
+            npoles = int(lines[i][1])
+            j = 0
+            i += 1
+            while j < npoles:
+                poles.append(float(lines[i][0]) + float(lines[i][1])*1j)
+                j += 1
+                i += 1
+        if lines[i][0] == 'CONSTANT':
+            constant = float(lines[i][1])
+        i += 1
+
+    if not len(poles) == npoles:
+        raise TypeError('Incorrect number of poles in PZ file')
+    if not len(zeros) == nzeros:
+        raise TypeError('Incorrect number of zeros in PZ file')
+    if constant <= 0.:
+        raise TypeError('Missed the constant in the PZ file')
+    return {'poles' : poles, 'zeros' : zeros, 'gain' : constant, 'sensitivity' : 1.}
 
 def read_vmodel(vmodel_file, **kwargs):
     """
