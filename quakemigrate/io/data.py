@@ -315,8 +315,15 @@ class Archive:
                 try:
                     read_start = starttime - pre_pad
                     read_end = endtime + post_pad
-                    st += read(file, starttime=read_start, endtime=read_end,
-                               nearest_sample=True)
+
+                    if self.waveform_merge_method == -1:
+                        st += read(file, starttime=read_start, 
+                                endtime=read_end,
+                                nearest_sample=True)
+                    else:
+                        st += read(file, starttime=read_start-10., 
+                                endtime=read_end+10.,
+                                nearest_sample=True)
                 except TypeError:
                     logging.info(f"File not compatible with ObsPy - {file}")
                     continue
@@ -336,6 +343,9 @@ class Archive:
             # shifted when it is used to calculate the onset function /
             # migrated.
             st = util.shift_to_sample(st, interpolate=self.interpolate)
+            if not self.waveform_merge_method == -1:
+                st.trim(starttime=read_start, endtime=read_end,
+                        nearest_sample=False)
 
             if self.read_all_stations:
                # Re-populate st with only stations in station file
@@ -591,20 +601,24 @@ class WaveformData:
         if bool(st):
             # Loop through channels with unique SEED id's
             for tr_id in sorted(set([tr.id for tr in st])):
+                logging.debug('Checking- {}'.format(tr_id))
                 st_id = st.select(id=tr_id)
                 availability[tr_id] = 0
 
                 # Check it's not flatlined
                 if any(tr.data.max() == tr.data.min() for tr in st_id):
+                    logging.debug('\tFailed with no data')
                     continue
                 # Check for overlaps
                 overlaps = st_id.get_gaps(max_gap=-0.000001)
                 if len(overlaps) != 0:
+                    logging.debug('\tFailed with overlapping data')
                     continue
                 # Check for gaps (if requested)
                 if not allow_gaps:
                     gaps = st_id.get_gaps()  # Overlaps already dealt with
                     if len(gaps) != 0:
+                        logging.debug('\tFailed with the presence of gaps')
                         continue
                 # Check sampling rate
                 if check_sampling_rate:
@@ -614,6 +628,7 @@ class WaveformData:
                                         " correct sampling rate.")
                     if any(tr.stats.sampling_rate != sampling_rate \
                         for tr in st_id):
+                        logging.debug('\tFailed with sample rate')
                         continue
                 # Check data covers full timespan (if requested) - this
                 # strictly checks the *timespan*, so uses the trace sampling
@@ -622,15 +637,19 @@ class WaveformData:
                 if full_timespan:
                     n_samples = timespan * st_id[0].stats.sampling_rate + 1
                     if len(st_id) > 1:
+                        logging.debug('\tFailed due to Timespan')
                         continue
                     elif st_id[0].stats.npts < n_samples:
+                        logging.debug('\tFailed due to Timespan - not the correct number of samples')
                         continue
                 # Check start and end times of trace are exactly correct
                 if check_start_end_times:
                     if len(st_id) > 1:
+                        logging.debug('\tFailed due to start or end time')
                         continue
                     elif st_id[0].stats.starttime != self.starttime or \
                         st_id[0].stats.endtime != self.endtime:
+                        logging.debug('\tFailed due to start or end time')
                         continue
 
                 # If passed all tests, set availability to 1
