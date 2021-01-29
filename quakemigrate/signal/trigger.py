@@ -3,7 +3,7 @@
 Module to perform the trigger stage of QuakeMigrate.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -19,42 +19,6 @@ import pandas as pd
 from quakemigrate.io import Run, read_scanmseed, write_triggered_events
 from quakemigrate.plot import trigger_summary
 import quakemigrate.util as util
-
-
-def calculate_mad(x, scale=1.4826):
-    """
-    Calculates the Median Absolute Deviation (MAD) of the input array x.
-
-    Parameters
-    ----------
-    x : array-like
-        Coalescence array in.
-    scale : float, optional
-        A scaling factor for the MAD output to make the calculated MAD factor
-        a consistent estimation of the standard deviation of the distribution.
-
-    Returns
-    -------
-    scaled_mad : array-like
-        Array of scaled mean absolute deviation values for the input array, x,
-        scaled to provide an estimation of the standard deviation of the
-        distribution.
-
-    """
-
-    x = np.asarray(x)
-
-    if not x.size:
-        return np.nan
-
-    if np.isnan(np.sum(x)):
-        return np.nan
-
-    # Calculate median and mad values:
-    med = np.apply_over_axes(np.median, x, 0)
-    mad = np.median(np.abs(x - med), axis=0)
-
-    return scale * mad
 
 
 def chunks2trace(a, new_shape):
@@ -92,14 +56,15 @@ class Trigger:
     """
     QuakeMigrate triggering class.
 
-    Triggers candidate earthquakes from the maximum coalescence through time
-    data output by the decimated detect scan, ready to be run through locate().
+    Triggers candidate earthquakes from the continuous maximum coalescence
+    through time data output by the decimated detect scan, ready to be run
+    through locate().
 
     Parameters
     ----------
-    lut : :class:`~quakemigrate.lut.LUT` object
-        Contains the traveltime lookup tables for P- and S-phases, computed for
-        some pre-defined velocity model.
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
+        Contains the traveltime lookup tables for the selected seismic phases,
+        computed for some pre-defined velocity model.
     run_path : str
         Points to the top level directory containing all input files, under
         which the specific run directory will be created.
@@ -128,10 +93,13 @@ class Trigger:
         Default: 1.4826, which is the appropriate scaling factor for a normal
         distribution.
     marginal_window : float, optional
-        Time window over which to marginalise the coalescence, making it solely
-        a function of the spatial dimensions. This should be an estimate of the
-        time error, as derived from an estimate of the spatial error and error
-        in the velocity model. Default: 2 seconds.
+        Half-width of window centred on the maximum coalescence time. The
+        4-D coalescence functioned is marginalised over time across this window
+        such that the earthquake location and associated uncertainty can be
+        appropriately calculated. It should be an estimate of the time
+        uncertainty in the earthquake origin time, which itself is some
+        combination of the expected spatial uncertainty and uncertainty in the
+        seismic velocity model used. Default: 2 seconds.
     min_event_interval : float, optional
         Minimum time interval between triggered events. Must be at least twice
         the marginal window. Default: 4 seconds.
@@ -141,7 +109,9 @@ class Trigger:
     pad : float, optional
         Additional time padding to ensure events close to the starttime/endtime
         are not cut off and missed. Default: 120 seconds.
-    run : :class:`~quakemigrate.io.Run` object
+    plot_trigger_summary : bool, optional
+        Plot triggering through time for each batched segment. Default: True.
+    run : :class:`~quakemigrate.io.core.Run` object
         Light class encapsulating i/o path information for a given run.
     static_threshold : float, optional
         Static threshold value above which to trigger candidate events.
@@ -159,17 +129,22 @@ class Trigger:
         treated as a comment - this can be used to include references. See the
         Volcanotectonic_Iceland example XY_files for a template.\n
         .. note:: Do not include a header line in either file.
+    plot_all_stns : bool, optional
+        If true, plot all stations used for detect. Otherwise, only plot
+        stations which for which some data was available during the trigger
+        time window. NOTE: if no station availability data is found, all
+        stations in the LUT will be plotted. (Default: True)
 
     Methods
     -------
-    trigger(starttime, endtime, region=None, savefig=True)
+    trigger(starttime, endtime, region=None, interactive_plot=False)
         Trigger candidate earthquakes from decimated detect scan results.
 
     Raises
     ------
     ValueError
         If `min_event_interval` < 2 * `marginal_window`.
-    InvalidThresholdMethodException
+    InvalidTriggerThresholdMethodException
         If an invalid threshold method is passed in by the user.
     TimeSpanException
         If the user supplies a starttime that is after the endtime.
@@ -194,15 +169,18 @@ class Trigger:
             self.mad_window_length = kwargs.get("mad_window_length", 3600.)
             self.mad_multiplier = kwargs.get("mad_multiplier", 1.)
         else:
-            raise util.InvalidThresholdMethodException
+            raise util.InvalidTriggerThresholdMethodException
         self.marginal_window = kwargs.get("marginal_window", 2.)
         self.min_event_interval = kwargs.get("min_event_interval", 4.)
-        self.minimum_repeat = kwargs.get("minimum_repeat", 4.)
+        if kwargs.get("minimum_repeat"):
+            self.minimum_repeat = kwargs.get("minimum_repeat")
         self.normalise_coalescence = kwargs.get("normalise_coalescence", False)
         self.pad = kwargs.get("pad", 120.)
 
-        # --- Plotting parameters ---
+        # --- Plotting toggles and parameters ---
+        self.plot_trigger_summary = kwargs.get("plot_trigger_summary", True)
         self.xy_files = kwargs.get("xy_files")
+        self.plot_all_stns = kwargs.get("plot_all_stns", True)
 
     def __str__(self):
         """Return short summary string of the Trigger object."""
@@ -223,23 +201,23 @@ class Trigger:
 
         return out
 
-    def trigger(self, starttime, endtime, region=None, savefig=True):
+    def trigger(self, starttime, endtime, region=None, interactive_plot=False):
         """
         Trigger candidate earthquakes from decimated scan data.
 
         Parameters
         ----------
         starttime : str
-            Timestamp from which to trigger.
+            Timestamp from which to trigger events.
         endtime : str
-            Timestamp up to which to trigger.
+            Timestamp up to which to trigger events.
         region : list of floats, optional
-            Only write triggered events within this region to the triggered
-            events csv file (for use in locate.) Format is:
+            Only retain triggered events located within this region. Format is:
                 [Xmin, Ymin, Zmin, Xmax, Ymax, Zmax]
-            Units are longitude / latitude / metres (in positive-down frame).
-        savefig : bool, optional
-            Save triggered events figure (default) or open interactive view.
+            As longitude / latitude / depth (units corresponding to the lookup
+            table grid projection; in positive-down frame).
+        interactive_plot : bool, optional
+            Toggles whether to produce an interactive plot. Default: False.
 
         Raises
         ------
@@ -263,28 +241,28 @@ class Trigger:
         while batchstart < endtime:
             next_day = UTCDateTime(batchstart.date) + 86400
             batchend = next_day if next_day <= endtime else endtime
-            self._trigger_batch(batchstart, batchend, region, savefig)
+            self._trigger_batch(batchstart, batchend, region, interactive_plot)
             batchstart = next_day
 
         logging.info(util.log_spacer)
 
-    def _trigger_batch(self, batchstart, batchend, region, savefig):
+    def _trigger_batch(self, batchstart, batchend, region, interactive_plot):
         """
         Wraps all of the methods used in sequence to determine triggers.
 
         Parameters
         ----------
         batchstart : `obspy.UTCDateTime` object
-            Timestamp from which to trigger.
+            Timestamp from which to trigger events.
         batchend : `obspy.UTCDateTime` object
-            Timestamp up to which to trigger.
+            Timestamp up to which to trigger events.
         region : list of floats
-            Only write triggered events within this region to the triggered
-            events csv file (for use in locate.) Format is:
+            Only retain triggered events located within this region. Format is:
                 [Xmin, Ymin, Zmin, Xmax, Ymax, Zmax]
-            Units are longitude / latitude / metres (in positive-down frame).
-        savefig : bool
-            Save triggered events figure (default) or open interactive view.
+            As longitude / latitude / depth (units corresponding to the lookup
+            table grid projection; in positive-down frame).
+        interactive_plot : bool
+            Toggles whether to produce an interactive plot. Default: False.
 
         """
 
@@ -302,6 +280,7 @@ class Trigger:
             logging.info("\tNo events triggered at this threshold - try a "
                          "lower detection threshold.")
             events = candidate_events
+            discarded = candidate_events
         else:
             refined_events = self._refine_candidates(candidate_events)
             events = self._filter_events(refined_events, batchstart, batchend,
@@ -313,12 +292,15 @@ class Trigger:
             logging.info("\n\tWriting triggered events to file...")
             write_triggered_events(self.run, events, batchstart)
 
-        logging.info("\n\tPlotting trigger summary...")
-        trigger_summary(events, batchstart, batchend, self.run,
-                        self.marginal_window, self.min_event_interval,
-                        threshold, self.normalise_coalescence, self.lut,
-                        data, region, savefig, discarded,
-                        xy_files=self.xy_files)
+        if self.plot_trigger_summary:
+            logging.info("\n\tPlotting trigger summary...")
+            trigger_summary(events, batchstart, batchend, self.run,
+                            self.marginal_window, self.min_event_interval,
+                            threshold, self.normalise_coalescence, self.lut,
+                            data, region, discarded,
+                            interactive=interactive_plot,
+                            xy_files=self.xy_files,
+                            plot_all_stns=self.plot_all_stns)
 
     @util.timeit()
     def _get_threshold(self, scandata, sampling_rate):
@@ -348,7 +330,8 @@ class Trigger:
             chunks = np.split(scandata.values, breaks)
 
             # Calculate the mad and median values
-            mad_values = np.asarray([calculate_mad(chunk) for chunk in chunks])
+            mad_values = \
+                np.asarray([util.calculate_mad(chunk) for chunk in chunks])
             median_values = np.asarray([np.median(chunk) for chunk in chunks])
             mad_trace = chunks2trace(mad_values, (len(chunks), len(chunks[0])))
             median_trace = chunks2trace(median_values, (len(chunks),
@@ -374,7 +357,9 @@ class Trigger:
         ----------
         scandata : `pandas.DataFrame` object
             Data output by detect() -- decimated scan.
-            Columns: ["DT", "COA", "COA_N", "X", "Y", "Z"] - X/Y/Z as lon/lat/m
+            Columns: ["DT", "COA", "COA_N", "X", "Y", "Z"] - X/Y/Z as lon/lat/
+            z-units corresponding to the units of the lookup table grid
+            projection.
         trigger_on : str
             Specifies the maximum coalescence data on which to trigger events.
         threshold : `numpy.ndarray` object
@@ -502,14 +487,14 @@ class Trigger:
             "CoaTime", "TRIG_COA", "COA_X", "COA_Y", "COA_Z", "MinTime",
             "MaxTime", "COA", "COA_NORM"].
         starttime : `obspy.UTCDateTime` object
-            Timestamp from which to trigger.
+            Timestamp from which to trigger events.
         endtime : `obspy.UTCDateTime` object
-            Timestamp up to which to trigger.
-        region : list
-            Only write triggered events within this region to the triggered
-            events csv file (for use in locate.) Format is:
+            Timestamp up to which to trigger events.
+        region : list of floats
+            Only retain triggered events located within this region. Format is:
                 [Xmin, Ymin, Zmin, Xmax, Ymax, Zmax]
-            Units are longitude / latitude / metres (elevation; up is positive)
+            As longitude / latitude / depth (units corresponding to the lookup
+            table grid projection; in positive-down frame).
 
         Returns
         -------

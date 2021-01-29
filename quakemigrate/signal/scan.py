@@ -3,7 +3,7 @@
 Module to perform core QuakeMigrate functions: detect() and locate().
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -42,13 +42,13 @@ class QuakeScan:
 
     Parameters
     ----------
-    archive : :class:`~quakemigrate.io.Archive` object
+    archive : :class:`~quakemigrate.io.data.Archive` object
         Details the structure and location of a data archive and provides
         methods for reading data from file.
-    lut : :class:`~quakemigrate.lut.LUT` object
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
         Contains the traveltime lookup tables for seismic phases, computed for
         some pre-defined velocity model.
-    onset : :class:`~quakemigrate.signal.onsets.Onset` object
+    onset : :class:`~quakemigrate.signal.onsets.base.Onset` object
         Provides callback methods for calculation of onset functions.
     run_path : str
         Points to the top level directory containing all input files, under
@@ -73,7 +73,8 @@ class QuakeScan:
     loglevel : {"info", "debug"}, optional
         Toggle to set the logging level: "debug" will print out additional
         diagnostic information to the log and stdout. (Default "info")
-    mags : :class:`~quakemigrate.signal.local_mag.LocalMag` object, optional
+    mags : :class:`~quakemigrate.signal.local_mag.local_mag.LocalMag` object, \
+        optional
         Provides methods for calculating local magnitudes, performed during
         locate.
     marginal_window : float, optional
@@ -84,7 +85,8 @@ class QuakeScan:
         uncertainty in the earthquake origin time, which itself is some
         combination of the expected spatial uncertainty and uncertainty in the
         seismic velocity model used. Default: 2 seconds.
-    picker : :class:`~quakemigrate.signal.pickers.PhasePicker` object, optional
+    picker : :class:`~quakemigrate.signal.pickers.base.PhasePicker` object, \
+        optional
         Provides callback methods for phase picking, performed during locate.
     plot_event_summary : bool, optional
         Plot event summary figure - see `quakemigrate.plot` for more details.
@@ -97,11 +99,14 @@ class QuakeScan:
     pre_pad : float
         Additional amount of data to read in before the timestep, used to
         ensure the correct coalescence is calculated at every sample.
-    run : :class:`~quakemigrate.io.Run` object
+    real_waveform_units : {"displacement", "velocity"}
+        Units to output real cut waveforms.
+    run : :class:`~quakemigrate.io.core.Run` object
         Light class encapsulating i/o path information for a given run.
-    sampling_rate : int, optional
-        Desired sampling rate of input data; sampling rate at which to compute
-        the coalescence function. Default: 50 Hz.
+    scan_rate : int, optional
+        Sampling rate at which the 4-D coalescence map will be calculated.
+        Currently fixed to be the same as the onset function sampling rate (not
+        user-configurable).
     threads : int, optional
         The number of threads for the C functions to use on the executing host.
         Default: 1 thread.
@@ -110,10 +115,32 @@ class QuakeScan:
         run duration should be divisible by timestep. Increasing timestep will
         increase RAM usage during detect, but will slightly speed up overall
         detect run. Default: 120 seconds.
+    wa_waveform_units : {"displacement", "velocity"}
+        Units to output Wood-Anderson simulated cut waveforms.
     write_cut_waveforms : bool, optional
-        Write raw cut waveforms for all data found in the archive for each
-        event located by locate(). Default: False.
-        Note: this data has not been processed or quality-checked!
+        Write raw cut waveforms for all data read from the archive for each
+        event located by locate(). See `~quakemigrate.io.data.Archive`
+        parameter `read_all_stations`. Default: False.
+        NOTE: this data has not been processed or quality-checked!
+    write_real_waveforms : bool, optional
+        Write real cut waveforms for all data read from the archive for each
+        event located by locate(). See `~quakemigrate.io.data.Archive`
+        parameter `read_all_stations`. Default: False.
+        NOTE: the units of this data (displacement or velocity) are controlled
+        by `real_waveform_units`.
+        NOTE: this data has not been processed or quality-checked!
+        NOTE: no padding has been added to take into account the taper applied
+        during response removal.
+    write_wa_waveforms : bool, optional
+        Write Wood-Anderson simulated cut waveforms for all data read from the
+        archive for each event located by locate(). See
+        `~quakemigrate.io.data.Archive` parameter `read_all_stations`.
+        Default: False.
+        NOTE: the units of this data (displacement or velocity) are controlled
+        by `wa_waveform_units`.
+        NOTE: this data has not been processed or quality-checked!
+        NOTE: no padding has been added to take into account the taper applied
+        during response removal.
     xy_files : str, optional
         Path to comma-separated value file (.csv) containing a series of
         coordinate files to plot. Columns: ["File", "Color", "Linewidth",
@@ -142,26 +169,25 @@ class QuakeScan:
         throughout entire time period; output as .scanmseed (in mSEED format).
     locate(starttime, endtime) or locate(file)
         Core locate method -- compute 3-D coalescence over short time window
-        around candidate earthquake triggered from coastream; output location &
-        uncertainties (.event file), phase picks (.picks file), plus multiple
-        optional plots / data for further analysis and processing.
+        around candidate earthquake triggered from continuous detect output;
+        output location & uncertainties (.event file), phase picks (.picks
+        file), plus multiple optional plots / data for further analysis and
+        processing.
 
     Raises
     ------
     OnsetTypeError
-        If an object is passed in through the `onset` argument that does not
-        derive from the :class:`~quakemigrate.signal.onsets.Onset` base class.
-    PickerTypeError
-        If an object is passed in through the `picker` argument that does not
-        derive from the :class:`~quakemigrate.signal.pickers.PhasePicker` base
+        If an object is passed in through the `onset` argument that is not
+        derived from the :class:`~quakemigrate.signal.onsets.base.Onset` base
         class.
+    PickerTypeError
+        If an object is passed in through the `picker` argument that is not
+        derived from the :class:`~quakemigrate.signal.pickers.base.PhasePicker`
+        base class.
     RuntimeError
         If the user does not supply the locate function with valid arguments.
     TimeSpanException
         If the user supplies a starttime that is after the endtime.
-    NoMagObjectError
-        If the user selects to calculate magnitudes but does not provide a
-        :class:`~quakemigrate.signal.local_mag.LocalMag` object.
 
     """
 
@@ -203,8 +229,8 @@ class QuakeScan:
         # General QuakeScan parameters
         self.threads = kwargs.get("threads", 1)
         self.n_cores = kwargs.get("n_cores")  # DEPRECATING
-        self.sampling_rate = kwargs.get("sampling_rate", 50)
-        self.scan_rate = kwargs.get("scan_rate", 50)  # FUTURE
+        self.sampling_rate = kwargs.get("sampling_rate")  # DEPRECATING
+        self.scan_rate = self.onset.sampling_rate
 
         # Magnitudes
         mags = kwargs.get("mags")
@@ -222,6 +248,12 @@ class QuakeScan:
         self.continuous_scanmseed_write = kwargs.get(
             "continuous_scanmseed_write", False)
         self.write_cut_waveforms = kwargs.get("write_cut_waveforms", False)
+        self.write_real_waveforms = kwargs.get("write_real_waveforms", False)
+        self.real_waveform_units = kwargs.get("real_waveform_units",
+                                              "displacement")
+        self.write_wa_waveforms = kwargs.get("write_wa_waveforms", False)
+        self.wa_waveform_units = kwargs.get("wa_waveform_units",
+                                            "displacement")
         self.cut_waveform_format = kwargs.get("cut_waveform_format", "MSEED")
 
         # +++ TO BE REMOVED TO ARCHIVE CLASS +++
@@ -233,7 +265,7 @@ class QuakeScan:
         """Return short summary string of the QuakeScan object."""
 
         out = ("\tScan parameters:\n"
-               f"\t\tData sampling rate = {self.sampling_rate} Hz\n"
+               f"\t\tScan sampling rate = {self.scan_rate} Hz\n"
                f"\t\tThread count       = {self.threads}\n")
         if self.run.stage == "detect":
             out += f"\t\tTime step          = {self.timestep} s\n"
@@ -244,15 +276,15 @@ class QuakeScan:
 
     def detect(self, starttime, endtime):
         """
-        Scans through continuous data calculating coalescence on a (decimated)
-        3-D grid by back-migrating onset (characteristic) functions.
+        Scans through data calculating coalescence in a (decimated) 3-D grid by
+        continuously migrating onset functions.
 
         Parameters
         ----------
         starttime : str
-            Timestamp from which to run continuous scan (detect).
+            Timestamp from which to run continuous scan.
         endtime : str
-            Timestamp up to which to run continuous scan (detect).
+            Timestamp up to which to run continuous scan.
             Note: the last sample returned will be that which immediately
             precedes this timestamp.
 
@@ -280,7 +312,7 @@ class QuakeScan:
 
     def locate(self, starttime=None, endtime=None, trigger_file=None):
         """
-        Re-computes the 3-D coalescence on an undecimated grid for a short
+        Re-computes the coalescence on an undecimated grid for a short
         time window around each candidate earthquake triggered from the
         (decimated) continuous detect scan. Calculates event location and
         uncertainties, makes phase arrival picks, plus multiple optional
@@ -321,6 +353,7 @@ class QuakeScan:
         logging.info(self.onset)
         logging.info(self.picker)
         if self.mags is not None:
+            logging.info(self.archive.__str__(response_only=True))
             logging.info(self.mags)
         logging.info(util.log_spacer)
 
@@ -348,39 +381,45 @@ class QuakeScan:
         """
 
         coalescence = ScanmSEED(self.run, self.continuous_scanmseed_write,
-                                self.sampling_rate)
+                                self.scan_rate)
 
-        pre_pad, post_pad = self.onset.pad(self.timestep)
-        self.pre_pad, self.post_pad = pre_pad, post_pad
-        nsteps = int(np.ceil((endtime - starttime) / self.timestep))
-        try:
-            availability = pd.DataFrame(index=np.arange(nsteps),
-                                        columns=self.lut.traveltimes.keys())
-        except AttributeError:
-            availability = pd.DataFrame(index=np.arange(nsteps),
-                                        columns=self.lut.maps.keys())
+        self.pre_pad, self.post_pad = self.onset.pad(self.timestep)
+        n_steps = int(np.ceil((endtime - starttime) / self.timestep))
+        availability_cols = np.array([[f"{stat}_{ph}" for stat
+                                       in self.archive.stations]
+                                      for ph in self.onset.phases]).flatten()
+        availability = pd.DataFrame(index=range(n_steps),
+                                    columns=availability_cols)
 
-        for i in range(nsteps):
+        for i in range(n_steps):
             w_beg = starttime + self.timestep*i - self.pre_pad
             w_end = starttime + self.timestep*(i + 1) + self.post_pad
-            logging.debug("~"*20 + f" Processing : {w_beg}-{w_end} " + "~"*20)
-            logging.info("~"*20 + f" Processing : {w_beg + self.pre_pad}-"
-                         + f"{w_end - self.post_pad} " + "~"*20)
+            logging.debug(f" Processing : {w_beg}-{w_end} ".center(110, "~"))
+            logging.info((f" Processing : {w_beg + self.pre_pad}-"
+                          f"{w_end - self.post_pad} ").center(110, "~"))
 
             try:
-                data = self.archive.read_waveform_data(w_beg, w_end,
-                                                       self.sampling_rate)
-                coalescence.append(*self._compute(data),
+                data = self.archive.read_waveform_data(w_beg, w_end)
+                time, max_coa, max_coa_n, coord, onset_data = \
+                    self._compute(data)
+                coalescence.append(time, max_coa, max_coa_n, coord,
                                    self.lut.unit_conversion_factor)
-                availability.loc[i] = data.availability
+                availability.loc[i] = onset_data.availability
             except util.ArchiveEmptyException as e:
                 coalescence.empty(starttime, self.timestep, i, e.msg,
                                   self.lut.unit_conversion_factor)
-                availability.loc[i] = np.zeros(len(self.archive.stations))
+                availability.loc[i] = np.zeros(len(availability_cols),
+                                               dtype=np.int)
             except util.DataGapException as e:
                 coalescence.empty(starttime, self.timestep, i, e.msg,
                                   self.lut.unit_conversion_factor)
-                availability.loc[i] = np.zeros(len(self.archive.stations))
+                availability.loc[i] = np.zeros(len(availability_cols),
+                                               dtype=np.int)
+            except util.DataAvailabilityException as e:
+                coalescence.empty(starttime, self.timestep, i, e.msg,
+                                  self.lut.unit_conversion_factor)
+                availability.loc[i] = np.zeros(len(availability_cols),
+                                               dtype=np.int)
 
             availability.rename(index={i: str(starttime + self.timestep*i)},
                                 inplace=True)
@@ -411,27 +450,30 @@ class QuakeScan:
         triggered_events = read_triggered_events(self.run, **kwargs)
         n_events = len(triggered_events.index)
 
-        pre_pad, post_pad = self.onset.pad(4*self.marginal_window)
-        self.pre_pad, self.post_pad = pre_pad, post_pad
+        self.pre_pad, self.post_pad = self.onset.pad(4*self.marginal_window)
 
         for i, triggered_event in triggered_events.iterrows():
-            event = Event(triggered_event, self.marginal_window)
-            w_beg = event.coa_time - 2*self.marginal_window - self.pre_pad
-            w_end = event.coa_time + 2*self.marginal_window + self.post_pad
+            event = Event(self.marginal_window, triggered_event)
+            w_beg = event.trigger_time - 2*self.marginal_window - self.pre_pad
+            w_end = event.trigger_time + 2*self.marginal_window + self.post_pad
             logging.info(util.log_spacer)
             logging.info(f"\tEVENT - {i+1} of {n_events} - {event.uid}")
             logging.info(util.log_spacer)
 
             try:
                 logging.info("\tReading waveform data...")
-                event.add_waveform_data(self._read_event_waveform_data(w_beg,
-                                                                       w_end))
+                event.add_waveform_data(
+                    self._read_event_waveform_data(w_beg, w_end))
                 logging.info("\tComputing 4-D coalescence function...")
-                event.add_coalescence(*self._compute(event.data, event))  # pylint: disable=E1120
+                event.add_compute_output(  # pylint: disable=E1120
+                    *self._compute(event.data, event))
             except util.ArchiveEmptyException as e:
                 logging.info(e.msg)
                 continue
             except util.DataGapException as e:
+                logging.info(e.msg)
+                continue
+            except util.DataAvailabilityException as e:
                 logging.info(e.msg)
                 continue
 
@@ -443,7 +485,7 @@ class QuakeScan:
                 continue
 
             logging.info("\tDetermining event location and uncertainty...")
-            marginalised_coalescence = self._calculate_location(event)
+            marginalised_coa_map = self._calculate_location(event)
 
             logging.info("\tMaking phase picks...")
             event, _ = self.picker.pick_phases(event, self.lut, self.run)
@@ -455,16 +497,30 @@ class QuakeScan:
             event.write(self.run, self.lut)
 
             if self.plot_event_summary:
-                event_summary(self.run, event, marginalised_coalescence,
+                event_summary(self.run, event, marginalised_coa_map,
                               self.lut, xy_files=self.xy_files)
 
             if self.plot_event_video:
                 logging.info("Support for event videos coming soon.")
 
             if self.write_cut_waveforms:
-                write_cut_waveforms(self.run, event, self.cut_waveform_format)
+                write_cut_waveforms(self.run, event, self.cut_waveform_format,
+                                    pre_cut=self.pre_cut,
+                                    post_cut=self.post_cut)
+            if self.write_real_waveforms:
+                write_cut_waveforms(self.run, event, self.cut_waveform_format,
+                                    pre_cut=self.pre_cut,
+                                    post_cut=self.post_cut,
+                                    waveform_type="real",
+                                    units=self.real_waveform_units)
+            if self.write_wa_waveforms:
+                write_cut_waveforms(self.run, event, self.cut_waveform_format,
+                                    pre_cut=self.pre_cut,
+                                    post_cut=self.post_cut,
+                                    waveform_type="wa",
+                                    units=self.wa_waveform_units)
 
-            del event, marginalised_coalescence
+            del event, marginalised_coa_map
             logging.info(util.log_spacer)
 
     @util.timeit("info")
@@ -494,11 +550,22 @@ class QuakeScan:
         """
 
         # --- Calculate continuous coalescence within 3-D volume ---
-        onsets = self.onset.calculate_onsets(data)
-        traveltimes = self.lut.serve_traveltimes(self.sampling_rate)
-        fsmp = util.time2sample(self.pre_pad, self.sampling_rate)
-        lsmp = util.time2sample(self.post_pad, self.sampling_rate)
-        avail = np.sum(data.availability)*2
+        onsets, onset_data = self.onset.calculate_onsets(data)
+        try:
+            traveltimes = self.lut.serve_traveltimes(onset_data.sampling_rate,
+                                                     onset_data.availability)
+        except KeyError as e:
+            msg = (f"Attempting to migrate phases {onset_data.phases}; but "
+                   f"traveltimes for {e} not found in the LUT. Please "
+                   "create a new lookup table with phases="
+                   f"{onset_data.phases}")
+            raise util.LUTPhasesException(msg)
+        # Here fsmp and lsmp are used to calculate the length of map4d from the
+        # shape of the onset functions --> need to use onset sampling_rate, not
+        # scan rate.
+        fsmp = util.time2sample(self.pre_pad, onset_data.sampling_rate)
+        lsmp = util.time2sample(self.post_pad, onset_data.sampling_rate)
+        avail = np.sum([value for _, value in onset_data.availability.items()])
         map4d = migrate(onsets, traveltimes, fsmp, lsmp, avail, self.threads)
 
         # --- Find continuous peak coalescence in 3-D volume ---
@@ -508,10 +575,10 @@ class QuakeScan:
         if self.run.stage == "detect":
             del map4d
             time = data.starttime + self.pre_pad
-            return time, max_coa, max_coa_n, coord
+            return time, max_coa, max_coa_n, coord, onset_data
         else:
-            times = event.mw_times(self.sampling_rate)
-            return times, max_coa, max_coa_n, coord, map4d
+            times = event.mw_times(self.scan_rate)
+            return times, max_coa, max_coa_n, coord, map4d, onset_data
 
     @util.timeit("info")
     def _read_event_waveform_data(self, w_beg, w_end):
@@ -535,58 +602,30 @@ class QuakeScan:
         # Extra pre- and post-pad default to 0.
         pre_pad = post_pad = 0.
 
-        if self.pre_cut or self.mags is not None:
-            if self.mags is not None and self.pre_cut:
-                pre_cut = max(self.mags.amp.noise_window + self.marginal_window,
-                              self.pre_cut)
-                logging.debug(f"{pre_cut}")
-            elif self.mags is not None:
-                pre_cut = self.mags.amp.noise_window + self.marginal_window
-                logging.debug((f"{self.mags.amp.noise_window}, {self.marginal_window},",
-                               f"{pre_cut}"))
-            else:
-                pre_cut = self.pre_cut
-            # only subtract 1*marginal_window so if the event otime moves by
-            # this much the selected pre_cut can still be applied
-            pre_pad = pre_cut - self.marginal_window - self.pre_pad
-            if pre_pad < 0:
-                if self.pre_cut:
-                    msg = (f"\t\tWarning: specified pre_cut {self.pre_cut} is"
-                           "shorter than default pre_pad\n"
-                           f"\t\t\tCutting from pre_pad = {self.pre_pad}")
-                    logging.info(msg)
-                pre_pad = 0.
+        # If calculating magnitudes, read in padding required for amplitude
+        # measurements.
+        if self.mags:
+            pre_pad, post_pad = self.mags.amp.pad(
+                self.marginal_window,
+                self.lut.max_traveltime,
+                self.lut.fraction_tt)
 
-        if self.post_cut or self.mags is not None:
-            if self.mags is not None and self.post_cut:
-                post_cut = max(((1 + self.lut.fraction_tt) *
-                                self.lut.max_traveltime + self.marginal_window
-                                + self.mags.amp.signal_window), self.post_cut)
-                logging.debug(f"{post_cut}")
-            elif self.mags is not None:
-                post_cut = ((1 + self.lut.fraction_tt) *
-                            self.lut.max_traveltime + self.marginal_window +
-                            self.mags.amp.signal_window)
-                logging.debug((f"{(1 + self.lut.fraction_tt)}, {self.lut.max_traveltime},",
-                               f"{self.marginal_window}, {self.mags.amp.signal_window}"))
-                logging.debug(f"{post_cut}")
-            else:
-                post_cut = self.post_cut
-            # only subtract 1*marginal_window so if the event otime moves by
-            # this much the selected post_cut can still be applied
-            post_pad = post_cut - self.marginal_window - self.post_pad
-            if post_pad < 0:
-                if self.post_cut:
-                    msg = (f"\t\tWarning: specified post_cut {self.post_cut} is"
-                           " shorter than default post_pad\n"
-                           f"t\t\tCutting to post_pad = {self.post_pad}")
-                    logging.info(msg)
-                post_pad = 0.
+        # If a specific pre / post cut has been requested by the user,
+        # check which is bigger.
+        if self.pre_cut:
+            pre_pad = max(pre_pad, self.pre_cut)
+        if self.post_cut:
+            post_pad = max(post_pad, self.post_cut)
+
+        # Trim the pre_pad and post_pad to avoid cutting more data than we
+        # need; only subtract 1*marginal_window so that if the event otime
+        # moves by this much (the maximum allowed) from the triggered event
+        # time, we still have the correct window of data to apply the pre_cut.
+        pre_pad = max(0., pre_pad - self.marginal_window - self.pre_pad)
+        post_pad = max(0., post_pad - self.marginal_window - self.post_pad)
 
         logging.debug(f"{w_beg}, {w_end}, {pre_pad}, {post_pad}")
-        return self.archive.read_waveform_data(w_beg, w_end,
-                                               self.sampling_rate, pre_pad,
-                                               post_pad)
+        return self.archive.read_waveform_data(w_beg, w_end, pre_pad, post_pad)
 
     @util.timeit("info")
     def _calculate_location(self, event):
@@ -601,9 +640,9 @@ class QuakeScan:
 
         Parameters
         ----------
-        event : :class:`~quakemigrate.io.Event` object
-            Light class encapsulating signal, onset, and location information
-            for a given event.
+        event : :class:`~quakemigrate.io.event.Event` object
+            Light class encapsulating waveforms, coalescence information, picks
+            and location information for a given event.
 
         Returns
         -------
@@ -961,27 +1000,38 @@ class QuakeScan:
 
         return mask
 
+    # --- Deprecation/Future handling ---
+    @property
+    def scan_rate(self):
+        """Get scan_rate"""
+        return self._scan_rate
+
+    @scan_rate.setter
+    def scan_rate(self, value):
+        if value is None:
+            return
+        elif value == self.onset.sampling_rate:
+            self._scan_rate = value
+            return
+        print("Warning: Parameter not yet user-configurable. Currently ")
+        print("the scan sampling rate must be the same as the onset sampling ")
+        print(f"rate, which you have set to {self.scan_rate} Hz. Please ")
+        print("contact the QuakeMigrate developers for further info.")
+
     @property
     def sampling_rate(self):
         """Get sampling_rate"""
-        return self._sampling_rate
+        return self.scan_rate
 
     @sampling_rate.setter
     def sampling_rate(self, value):
-        """
-        Set sampling_rate and try distribute to other objects.
+        if value is None:
+            return
+        print("Warning: Parameter name has changed - continuing. Currently ")
+        print("the scan sampling rate must be the same as the onset sampling ")
+        print(f"rate, which you have set to {self.scan_rate} Hz. Please ")
+        print("contact the QuakeMigrate developers for further info.")
 
-        """
-
-        try:
-            self.archive.sampling_rate = value
-            self.onset.sampling_rate = value
-            self.picker.sampling_rate = value
-        except AttributeError:
-            pass
-        self._sampling_rate = value
-
-    # --- Deprecation/Future handling ---
     @property
     def time_step(self):
         """Handler for deprecated attribute name 'time_step'"""

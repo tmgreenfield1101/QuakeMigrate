@@ -7,10 +7,10 @@ This script runs the locate stage for the Iceland dike intrusion example.
 # Stop numpy using all available threads (these environment variables must be
 # set before numpy is imported for the first time).
 import os
-os.environ.update(OMP_NUM_THREADS = "1",
-                  OPENBLAS_NUM_THREADS = "1",
-                  NUMEXPR_NUM_THREADS = "1",
-                  MKL_NUM_THREADS = "1")
+os.environ.update(OMP_NUM_THREADS="1",
+                  OPENBLAS_NUM_THREADS="1",
+                  NUMEXPR_NUM_THREADS="1",
+                  MKL_NUM_THREADS="1")
 
 from obspy.core import AttribDict
 
@@ -38,14 +38,18 @@ stations = read_stations(station_file)
 # --- Read in response inventory ---
 response_inv = read_response_inv(response_file)
 
+# --- Specify parameters for response removal ---
+response_params = AttribDict()
+response_params.pre_filt = (0.05, 0.06, 30, 35)
+response_params.water_level = 600
+
 # --- Create new Archive and set path structure ---
 archive = Archive(archive_path=data_in, stations=stations,
-                  archive_format="YEAR/JD/STATION", response_inv=response_inv)
+                  archive_format="YEAR/JD/STATION", response_inv=response_inv,
+                  response_removal_params=response_params)
 
 # --- Specify parameters for amplitude measurement ---
 amp_params = AttribDict()
-amp_params.pre_filt = (0.05, 0.06, 30, 35)
-amp_params.water_level = 600
 amp_params.signal_window = 5.0
 amp_params.highpass_filter = True
 amp_params.highpass_freq = 2.0
@@ -62,15 +66,17 @@ mags = LocalMag(amp_params=amp_params, mag_params=mag_params,
 lut = read_lut(lut_file=lut_file)
 
 # --- Create new Onset ---
-onset = STALTAOnset(position="centred")
-onset.p_bp_filter = [2, 16, 2]
-onset.s_bp_filter = [2, 16, 2]
-onset.p_onset_win = [0.2, 1.0]
-onset.s_onset_win = [0.2, 1.0]
+onset = STALTAOnset(position="centred", sampling_rate=50)
+onset.phases = ["P", "S"]
+onset.bandpass_filters = {
+    "P": [2, 16, 2],
+    "S": [2, 16, 2]}
+onset.sta_lta_windows = {
+    "P": [0.2, 1.0],
+    "S": [0.2, 1.0]}
 
 # --- Create new PhasePicker ---
 picker = GaussianPicker(onset=onset)
-picker.marginal_window = 1.0
 picker.plot_picks = True
 
 # --- Create new QuakeScan ---
@@ -82,11 +88,9 @@ scan = QuakeScan(archive, lut, onset=onset, picker=picker, mags=mags,
 # For a complete list of parameters and guidance on how to choose them, please
 # see the manual and read the docs.
 scan.marginal_window = 1.0
-scan.threads = 12
-scan.sampling_rate = 50
+scan.threads = 4  # NOTE: increase as your system allows to increase speed!
 
 # --- Toggle plotting options ---
-scan.plot_event_video = False
 scan.plot_event_summary = True
 scan.xy_files = "./inputs/XY_FILES/dike_xyfiles.csv"
 

@@ -4,7 +4,7 @@ This module provides parsers to export the output of a QuakeMigrate run to an
 ObsPy Catalog.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -25,6 +25,9 @@ from obspy.core.event import (Event, Origin, OriginUncertainty,
 from obspy.geodetics import kilometer2degrees
 
 import quakemigrate
+
+
+ns = "http://quakemigrate.github.io/xmlns/event"
 
 
 def read_quakemigrate(run_dir, units, run_subname="", local_mag_ph="S"):
@@ -127,16 +130,33 @@ def _read_single_event(event_file, locate_dir, units, local_mag_ph):
                                        version=quakemigrate.__version__)
 
     # Add COA info to extra
-    event.extra.coa = event_info["COA"]
-    event.extra.coa_norm = event_info["COA_NORM"]
-    event.extra.trig_coa = event_info["TRIG_COA"]
-    event.extra.dec_coa = event_info["DEC_COA"]
-    event.extra.dec_coa_norm = event_info["DEC_COA_NORM"]
+    event.extra.coa = {"value": event_info["COA"],
+                       "namespace": ns}
+    event.extra.coa_norm = {"value": event_info["COA_NORM"],
+                            "namespace": ns}
+    event.extra.trig_coa = {"value": event_info["TRIG_COA"],
+                            "namespace": ns}
+    event.extra.dec_coa = {"value": event_info["DEC_COA"],
+                           "namespace": ns}
+    event.extra.dec_coa_norm = {"value": event_info["DEC_COA_NORM"],
+                                "namespace": ns}
 
     # Determine location of cut waveform data - add to event object as a
     # custom extra attribute.
-    mseed = locate_dir / "cut_waveforms" / event_uid
-    event.extra.cut_waveforms_file = str(mseed.with_suffix(".m").resolve())
+    mseed = locate_dir / "raw_cut_waveforms" / event_uid
+    event.extra.cut_waveforms_file = {
+        "value": str(mseed.with_suffix(".m").resolve()),
+        "namespace": ns}
+    if (locate_dir / "real_cut_waveforms").exists():
+        mseed = locate_dir / "real_cut_waveforms" / event_uid
+        event.extra.real_cut_waveforms_file = {
+            "value": str(mseed.with_suffix(".m").resolve()),
+            "namespace": ns}
+    if (locate_dir / "wa_cut_waveforms").exists():
+        mseed = locate_dir / "wa_cut_waveforms" / event_uid
+        event.extra.wa_cut_waveforms_file = {
+            "value": str(mseed.with_suffix(".m").resolve()),
+            "namespace": ns}
 
     # Create origin with spline location and set to preferred event origin.
     origin = Origin()
@@ -203,7 +223,8 @@ def _read_single_event(event_file, locate_dir, units, local_mag_ph):
             if method == "autopick" and str(pickline["PickTime"]) != "-1":
                 pick.time = UTCDateTime(pickline["PickTime"])
                 pick.time_errors.uncertainty = float(pickline["PickError"])
-                pick.extra.snr = float(pickline["SNR"])
+                pick.extra.snr = {"value": float(pickline["SNR"]),
+                                  "namespace": ns}
             elif method == "modelled":
                 pick.time = UTCDateTime(pickline["ModelledTime"])
             else:
@@ -223,7 +244,7 @@ def _read_single_event(event_file, locate_dir, units, local_mag_ph):
                 amp = Amplitude()
                 if pd.isna(ampsline[phase]):
                     continue
-                amp.generic_amplitude = ampsline[phase] / 1000 # mm to m
+                amp.generic_amplitude = ampsline[phase] / 1000  # mm to m
                 amp.generic_amplitude_errors.uncertainty = noise_amp
                 amp.unit = "m"
                 amp.type = "AML"
@@ -236,6 +257,16 @@ def _read_single_event(event_file, locate_dir, units, local_mag_ph):
                 # amp.filter_id = ?
                 amp.magnitude_hint = "ML"
                 amp.evaluation_mode = "automatic"
+                amp.extra = AttribDict()
+                try:
+                    amp.extra.filter_gain = {
+                        "value": ampsline[f"{phase[0]}_filter_gain"],
+                        "namespace": ns}
+                    amp.extra.avg_amp = {
+                        "value": ampsline[f"{phase[0]}_avg_amp"] / 1000,  # m
+                        "namespace": ns}
+                except KeyError:
+                    pass
 
                 if phase[0] == local_mag_ph and not pd.isna(ampsline["ML"]):
                     i += 1
@@ -246,9 +277,12 @@ def _read_single_event(event_file, locate_dir, units, local_mag_ph):
                     stat_mag.mag_errors.uncertainty = ampsline["ML_Err"]
                     stat_mag.station_magnitude_type = "ML"
                     stat_mag.amplitude_id = amp.resource_id
-                    stat_mag.extra.picked = ampsline["is_picked"]
-                    stat_mag.extra.epi_dist = ampsline["epi_dist"]
-                    stat_mag.extra.z_dist = ampsline["z_dist"]
+                    stat_mag.extra.picked = {"value": ampsline["is_picked"],
+                                             "namespace": ns}
+                    stat_mag.extra.epi_dist = {"value": ampsline["epi_dist"],
+                                               "namespace": ns}
+                    stat_mag.extra.z_dist = {"value": ampsline["z_dist"],
+                                             "namespace": ns}
 
                     event.station_magnitudes.append(stat_mag)
 
@@ -262,7 +296,8 @@ def _read_single_event(event_file, locate_dir, units, local_mag_ph):
         # mag.origin_id = ?
         mag.station_count = i
         mag.evaluation_mode = "automatic"
-        mag.extra.r2 = event_info["ML_r2"]
+        mag.extra.r2 = {"value": event_info["ML_r2"],
+                        "namespace": ns}
 
         event.magnitudes = [mag]
         event.preferred_magnitude_id = mag.resource_id

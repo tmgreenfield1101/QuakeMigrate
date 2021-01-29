@@ -3,7 +3,7 @@
 Module that supplies various utility functions and classes.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime
 from functools import wraps
+from itertools import tee
 
 import matplotlib.ticker as ticker
 import numpy as np
@@ -30,9 +31,9 @@ def make_directories(run, subdir=None):
 
     Parameters
     ----------
-    run : pathlib Path object
+    run : `pathlib.Path` object
         Location of parent output directory, named by run name.
-    subdir : string, optional
+    subdir : str, optional
         subdir to make beneath the run level.
 
     """
@@ -170,11 +171,47 @@ def time2sample(time, sampling_rate):
     return int(round(time*int(sampling_rate)))
 
 
+def calculate_mad(x, scale=1.4826):
+    """
+    Calculates the Median Absolute Deviation (MAD) of the input array x.
+
+    Parameters
+    ----------
+    x : array-like
+        Input data.
+    scale : float, optional
+        A scaling factor for the MAD output to make the calculated MAD factor
+        a consistent estimation of the standard deviation of the distribution.
+
+    Returns
+    -------
+    scaled_mad : array-like
+        Array of scaled mean absolute deviation values for the input array, x,
+        scaled to provide an estimation of the standard deviation of the
+        distribution.
+
+    """
+
+    x = np.asarray(x)
+
+    if not x.size:
+        return np.nan
+
+    if np.isnan(np.sum(x)):
+        return np.nan
+
+    # Calculate median and mad values:
+    med = np.apply_over_axes(np.median, x, 0)
+    mad = np.median(np.abs(x - med), axis=0)
+
+    return scale * mad
+
+
 class DateFormatter(ticker.Formatter):
     """
     Extend the `matplotlib.ticker.Formatter` class to allow for millisecond
     precision when formatting a tick (in days since the epoch) with a
-    `~datetime.datetime.strftime` format string.
+    `datetime.datetime.strftime` format string.
 
     """
 
@@ -183,7 +220,7 @@ class DateFormatter(ticker.Formatter):
         Parameters
         ----------
         fmt : str
-            `~datetime.datetime.strftime` format string.
+            `datetime.datetime.strftime` format string.
         precision : int
             Degree of precision to which to report sub-second time intervals.
 
@@ -276,19 +313,176 @@ def wa_response(convert='DIS2DIS', obspy_def=True):
     return woodanderson
 
 
-def decimate(trace, sr):
+def shift_to_sample(stream, interpolate=False):
     """
-    Decimate a trace to achieve the desired sampling rate, sr.
+    Check whether any data in an `obspy.Stream` object is "off-sample" - i.e.
+    the data timestamps are *not* an integer number of samples after midnight.
+    If so, shift data to be "on-sample".
+
+    This can either be done by shifting the timestamps by a sub-sample time
+    interval, or interpolating the trace to the "on-sample" timestamps. The
+    latter has the benefit that it will not affect the timing of the data, but
+    will require additional computation time and some inevitable edge effects -
+    though for onset calculation these should be contained within the pad
+    windows. If you are using a sampling rate < 10 Hz, contact the QuakeMigrate
+    developers.
+
+    Parameters
+    ----------
+    stream : `obspy.Stream` object
+        Contains list of `obspy.Trace` objects for which to check the timing.
+    interpolate : bool, optional
+        Whether to interpolate the data to correct the "off-sample" timing.
+        Otherwise, the metadata will simply be altered to shift the timestamps
+        "on-sample"; this will lead to a sub-sample timing offset.
+
+    Returns
+    -------
+    stream : `obspy.Stream` object
+        Waveform data with all timestamps "on-sample".
+
+    """
+
+    # work on a copy
+    stream = stream.copy()
+
+    for tr in stream:
+        # Check if microsecond is divisible by sampling rate; only guaranteed
+        # to work for sampling rates of 1 Hz or less
+        delta = tr.stats.starttime.microsecond \
+            % (1e6 / tr.stats.sampling_rate)
+        if delta == 0:
+            if tr.stats.sampling_rate < 1.:
+                logging.warning(f"Trace\n\t{tr}\nhas a sampling rate less than"
+                                " 1 Hz, so off-sample data might not be "
+                                "corrected!")
+            continue
+        else:
+            # Calculate time shift to closest "on-sample" timestamp
+            time_shift = round(delta / 1e6 * tr.stats.sampling_rate) \
+                / tr.stats.sampling_rate - delta / 1e6
+            if not interpolate:
+                logging.info(f"Trace\n\t{tr}\nhas off-sample data. Applying "
+                             f"{time_shift:+f} s shift to timing.")
+                tr.stats.starttime += time_shift
+                logging.debug(f"Shifted trace: {tr}")
+            else:
+                logging.info(f"Trace\n\t{tr}\nhas off-sample data. "
+                             f"Interpolating to apply a {time_shift:+f} s "
+                             "shift to timing.")
+                # Interpolate can only map between values contained within the
+                # original array. For negative time shift, shift by one sample
+                # so new starttime is within original array, and add constant
+                # value pad after interpolation.
+                new_starttime = tr.stats.starttime + time_shift
+                if time_shift < 0.:
+                    new_starttime += tr.stats.delta
+                tr.interpolate(sampling_rate=tr.stats.sampling_rate,
+                               method="lanczos", a=20, starttime=new_starttime)
+                # Add constant-value pad at end if time_shift is positive,
+                # (last sample is dropped when interpolating for positive time
+                # shifts), else at start. If adding at start, also adjust start
+                # time.
+                if time_shift > 0.:
+                    tr.data = np.append(tr.data, tr.data[-1])
+                else:
+                    tr.data = np.append(tr.data[0], tr.data)
+                    tr.stats.starttime -= tr.stats.delta
+                logging.debug(f"Interpolated tr:\n\t{tr}")
+
+    return stream
+
+
+def resample(stream, sampling_rate, resample, upfactor, starttime, endtime):
+    """
+    Resample data in an `obspy.Stream` object to the specified sampling rate.
+
+    By default, this function will only perform decimation of the data. If
+    necessary, and if the user specifies `resample = True` and an upfactor
+    to upsample by `upfactor = int`, data can also be upsampled and then,
+    if necessary, subsequently decimated to achieve the desired sampling
+    rate.
+
+    For example, for raw input data sampled at a mix of 40, 50 and 100 Hz,
+    to achieve a unified sampling rate of 50 Hz, the user would have to
+    specify an upfactor of 5; 40 Hz x 5 = 200 Hz, which can then be
+    decimated to 50 Hz.
+
+    NOTE: assumes any data with off-sample timing has been corrected with
+    :func:`~quakemigrate.util.shift_to_sample`. If not, the resulting traces
+    may not all contain the correct number of samples.
 
     NOTE: data will be detrended and a cosine taper applied before
     decimation, in order to avoid edge effects when applying the lowpass
     filter.
 
+    Parameters
+    ----------
+    stream : `obspy.Stream` object
+        Contains list of `obspy.Trace` objects to be decimated / resampled.
+    resample : bool
+        If true, perform resampling of data which cannot be decimated
+        directly to the desired sampling rate.
+    upfactor : int or None
+        Factor by which to upsample the data to enable it to be decimated
+        to the desired sampling rate, e.g. 40Hz -> 50Hz requires
+        upfactor = 5.
+
+    Returns
+    -------
+    stream : `obspy.Stream` object
+        Contains list of resampled `obspy.Trace` objects at the chosen
+        sampling rate `sr`.
+
+    """
+
+    # Work on a copy of the stream
+    stream = stream.copy()
+
+    for trace in stream:
+        trace_sampling_rate = trace.stats.sampling_rate
+        if sampling_rate != trace_sampling_rate:
+            if (trace_sampling_rate % sampling_rate) == 0:
+                stream.remove(trace)
+                trace = decimate(trace, sampling_rate)
+                stream += trace
+            elif resample and upfactor is not None:
+                # Check the upsampled sampling rate can be decimated to sr
+                if int(trace_sampling_rate * upfactor) % sampling_rate != 0:
+                    raise BadUpfactorException(trace)
+                stream.remove(trace)
+                trace = upsample(trace, upfactor, starttime, endtime)
+                if trace_sampling_rate != sampling_rate:
+                    trace = decimate(trace, sampling_rate)
+                stream += trace
+            else:
+                logging.info("Mismatched sampling rates - cannot decimate "
+                             f"data from\n\t{trace}.\n..to resample data, set "
+                             "resample = True and choose a suitable upfactor")
+
+    # Trim as a general safety net. NOTE: here we are using
+    # nearest_sample=False, as all data in the stream should now be at the
+    # desired sampling rate, and with any off-sample data having had it's
+    # timing shifted.
+    stream.trim(starttime=starttime-0.00001, endtime=endtime+0.00001,
+                nearest_sample=False)
+
+    return stream
+
+
+def decimate(trace, sampling_rate):
+    """
+    Decimate a trace to achieve the desired sampling rate, sr.
+
+    NOTE: data will be detrended and a cosine taper applied before
+    decimation, in order to avoid edge effects when applying the lowpass
+    filter before decimating.
+
     Parameters:
     -----------
     trace : `obspy.Trace` object
         Trace to be decimated.
-    sr : int
+    sampling_rate : int
         Output sampling rate.
 
     Returns:
@@ -306,19 +500,24 @@ def decimate(trace, sr):
     trace.detrend('demean')
     trace.taper(type='cosine', max_percentage=0.05)
 
-    # Zero-phase lowpass filter at Nyquist frequency
-    trace.filter("lowpass", freq=float(sr) / 2.000001, corners=2,
+    # Zero-phase Butterworth-lowpass filter at Nyquist frequency
+    trace.filter("lowpass", freq=float(sampling_rate) / 2.000001, corners=2,
                  zerophase=True)
-    trace.decimate(factor=int(trace.stats.sampling_rate / sr),
+    trace.decimate(factor=int(trace.stats.sampling_rate / sampling_rate),
                    strict_length=False, no_filter=True)
 
     return trace
 
 
-def upsample(trace, upfactor):
+def upsample(trace, upfactor, starttime, endtime):
     """
     Upsample a data stream by a given factor, prior to decimation. The
-    upsampling is done using a linear interpolation.
+    upsampling is carried out by linear interpolation.
+
+    NOTE: assumes any data with off-sample timing has been corrected with
+    :func:`~quakemigrate.util.shift_to_sample`. If not, the resulting traces
+    may not all contain the correct number of samples (and desired start
+    and end times).
 
     Parameters
     ----------
@@ -335,20 +534,71 @@ def upsample(trace, upfactor):
     """
 
     data = trace.data
-    dnew = np.zeros(len(data)*upfactor - (upfactor - 1))
+    # Fenceposts
+    dnew = np.zeros((len(data) - 1) * upfactor + 1)
     dnew[::upfactor] = data
     for i in range(1, upfactor):
         dnew[i::upfactor] = float(i)/upfactor*data[1:] \
                         + float(upfactor - i)/upfactor*data[:-1]
 
+    # Check if start needs pad - if so pad with constant value (start value
+    # of original trace). Use inequality here to only apply padding to data at
+    # the start and end of the requested time window; not for other traces
+    # floating in the middle (in the case that there are gaps).
+    if 0. < trace.stats.starttime - starttime < trace.stats.delta:
+        logging.debug(f"Mismatched starttimes: {trace.stats.starttime}, "
+                      f"{starttime}")
+        # Calculate how many additional samples are needed
+        start_pad = np.round((trace.stats.starttime - starttime) \
+            * trace.stats.sampling_rate * upfactor)
+        logging.debug(f"Start pad = {start_pad}")
+        # Add padding data (constant value)
+        start_fill = np.full(np.int(start_pad), trace.data[0], dtype=int)
+        dnew = np.append(start_fill, dnew)
+        # Calculate new starttime of trace
+        new_starttime = trace.stats.starttime - start_pad \
+            / (trace.stats.sampling_rate * upfactor)
+        logging.debug(f"New starttime = {new_starttime}")
+    else:
+        new_starttime = trace.stats.starttime
+
+    # Ditto for end of trace
+    if 0. < endtime - trace.stats.endtime < trace.stats.delta:
+        logging.debug(f"Mismatched endtimes: {trace.stats.endtime}, {endtime}")
+        # Calculate how many additional samples are needed
+        end_pad = np.round((endtime - trace.stats.endtime) \
+            * trace.stats.sampling_rate * upfactor)
+        logging.debug(f"End pad = {end_pad}")
+        # Add padding data (constant value)
+        end_fill = np.full(np.int(end_pad), trace.data[-1], dtype=int)
+        dnew = np.append(dnew, end_fill)
+
     out = Trace()
     out.data = dnew
-    out.stats = trace.stats
+    out.stats = trace.stats.copy()
     out.stats.npts = len(out.data)
-    out.stats.starttime = trace.stats.starttime
+    out.stats.starttime = new_starttime
     out.stats.sampling_rate = int(upfactor * trace.stats.sampling_rate)
+    logging.debug(f"Raw upsampled trace:\n\t{out}")
+
+    # Trim to remove additional padding left from reading with
+    # nearest_sample=True at a variety of sampling rates.
+    # NOTE: here we are using nearest_sample=False, as all data in the stream
+    # should now be at a *multiple* of the desired sampling rate, and with any
+    # off-sample data having had it's timing shifted.
+    out.trim(starttime=starttime-0.00001, endtime=endtime+0.00001,
+             nearest_sample=False)
+    logging.debug(f"Trimmed upsampled trace:\n\t{out}")
 
     return out
+
+
+def pairwise(iterable):
+    """Utility to iterate over an iterable pairwise."""
+
+    a, b = tee(iterable)
+    next(b, None)
+    return zip(a, b)
 
 
 def timeit(*args_, **kwargs_):
@@ -448,21 +698,40 @@ class NoStationAvailabilityDataException(Exception):
         super().__init__(msg)
 
 
-class DataGapException(Exception):
+class DataAvailabilityException(Exception):
     """
-    Custom exception to handle case when all data has gaps for a given timestep
+    Custom exception to handle case when all data for the selected stations did
+    not pass the data quality criteria specified by the user.
 
     """
 
     def __init__(self):
-        msg = ("DataGapException: All available data had gaps for this "
-               "timestep.\n    OR: no data present in the archive for the"
-               "selected stations.")
+        msg = ("DataAvailabilityException: All data for this timestep did not "
+               "pass the specified data quality criteria.")
         super().__init__(msg)
 
         # Additional message printed to log
-        self.msg = ("\t\tAll available data for this time period contains gaps"
-                    "\n\t\tor data not available at start/end of time period")
+        self.msg = ("\t\tAll data for this timestep failed to pass the"
+                    "\n\t\tspecified data quality criteria. This includes the"
+                    "\n\t\tpresence of gaps or overlaps, or the data not"
+                    "\n\t\tspanning the full time window.")
+
+
+class DataGapException(Exception):
+    """
+    Custom exception to handle case when no data is found for the selected
+    stations for a given timestep.
+
+    """
+
+    def __init__(self):
+        msg = ("DataGapException: No data present in the archive for the"
+               "selected stations for this time window.")
+        super().__init__(msg)
+
+        # Additional message printed to log
+        self.msg = ("\t\tNo data for the selected stations was found in the"
+                    "\n\t\tarchive for this time window.")
 
 
 class ChannelNameException(Exception):
@@ -478,6 +747,19 @@ class ChannelNameException(Exception):
                "vertical and ending either 'E' & 'N' or '1' & '2' for\n"
                "horizontal components.\n    Working on trace: {}".format(trace))
         super().__init__(msg)
+
+
+class NoOnsetPeak(Exception):
+    """
+    Custom exception to handle case when no values in the onset function exceed
+    the threshold used for picking.
+
+    """
+
+    def __init__(self, pick_threshold):
+        self.msg = ("\t\t    No onset signal exceeding pick threshold "
+                    f"({pick_threshold:5.3f}) - continuing.")
+        super().__init__(self.msg)
 
 
 class BadUpfactorException(Exception):
@@ -517,6 +799,18 @@ class PickerTypeError(Exception):
     def __init__(self):
         msg = ("PickerTypeError: The PhasePicker object you have created does "
                "not inherit from the required base class - see manual.")
+        super().__init__(msg)
+
+
+class LUTPhasesException(Exception):
+    """
+    Custom exception to handle the case when the look-up table does not
+    contain the traveltimes for the phases necessary for a given function.
+
+    """
+
+    def __init__(self, message):
+        msg = (f"LUTPhasesException: {message}")
         super().__init__(msg)
 
 
@@ -656,14 +950,27 @@ class TimeSpanException(Exception):
         super().__init__(msg)
 
 
-class InvalidThresholdMethodException(Exception):
+class InvalidTriggerThresholdMethodException(Exception):
     """
     Custom exception to handle case when the user has not selected a valid
-    threshold method.
+    trigger threshold method.
 
     """
 
     def __init__(self):
-        msg = ("InvalidThresholdMethodException: Only 'static' or 'dynamic' "
-               "thresholds are supported.")
+        msg = ("InvalidTriggerThresholdMethodException: Only 'static' or "
+               "'dynamic' thresholds are supported.")
+        super().__init__(msg)
+
+
+class InvalidPickThresholdMethodException(Exception):
+    """
+    Custom exception to handle case when the user has not selected a valid
+    pick threshold method.
+
+    """
+
+    def __init__(self):
+        msg = ("InvalidPickThresholdMethodException: Only 'percentile' or "
+               "'MAD' thresholds are supported.")
         super().__init__(msg)

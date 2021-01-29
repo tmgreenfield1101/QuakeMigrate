@@ -3,7 +3,7 @@
 Module to produce traveltime lookup tables defined on a Cartesian grid.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -11,6 +11,7 @@ Module to produce traveltime lookup tables defined on a Cartesian grid.
 """
 
 import logging
+import warnings
 import os
 import pathlib
 import struct
@@ -24,7 +25,8 @@ import quakemigrate.util as util
 from .lut import LUT
 
 
-def read_nlloc(path, stations, phases=["P", "S"], fraction_tt=0.1, log=False):
+def read_nlloc(path, stations, phases=["P", "S"], fraction_tt=0.1,
+               save_file=None, log=False):
     """
     Read in a traveltime lookup table that is saved in the NonLinLoc format.
 
@@ -35,18 +37,26 @@ def read_nlloc(path, stations, phases=["P", "S"], fraction_tt=0.1, log=False):
     stations : `pandas.DataFrame`
         DataFrame containing station information (lat/lon/elev).
     phases : list of str, optional
-        List of seismic phases for which to calculate traveltimes.
+        List of seismic phases for which to read in traveltimes.
     fraction_tt : float, optional
         An estimate of the uncertainty in the velocity model as a function of
         a fraction of the traveltime. (Default 0.1 == 10%)
+    save_file : str, optional
+        Path to location to save pickled lookup table.
     log : bool, optional
         Toggle for logging - default is to only print information to stdout.
         If True, will also create a log file.
 
     Returns
     -------
-    lut : :class:`~quakemigrate.lut.LUT` object
-        Lookup table populated with traveltimes from the NonLinLoc files.
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
+        Lookup table populated with traveltimes from the NonLinLoc lookup table
+        files.
+
+    Raises
+    ------
+    NotImplementedError
+        If the specified projection type is not supported.
 
     """
 
@@ -92,6 +102,9 @@ def read_nlloc(path, stations, phases=["P", "S"], fraction_tt=0.1, log=False):
     lut.station_data = stations
     lut.phases = phases
 
+    if save_file is not None:
+        lut.save(save_file)
+
     return lut
 
 
@@ -113,17 +126,19 @@ def compute_traveltimes(grid_spec, stations, method, phases=["P", "S"],
     stations : `pandas.DataFrame`
         DataFrame containing station information (lat/lon/elev).
     method : str
-        Method to be used when computing the traveltime lookup tables.
-            "homogeneous" - straight line velocities
-            "1dfmm" - 1-D fast-marching method using scikit-fmm
-            "1dsweep" - a 2-D traveltime grid for a 1-D velocity model is swept
-                        over the 3-D grid using a bilinear interpolation scheme
+        Method to be used when computing the traveltime lookup tables.\n
+            "homogeneous" - straight line velocities.\n
+            "1dfmm" - 1-D fast-marching method using scikit-fmm.\n
+            "1dnlloc" - a 2-D traveltime grid is calculated from the 1-D\
+                        velocity model using the Grid2Time eikonal solver in\
+                        NonLinLoc, then swept over the 3-D grid using a\
+                        bilinear interpolation scheme.
     phases : list of str, optional
         List of seismic phases for which to calculate traveltimes.
     fraction_tt : float, optional
         An estimate of the uncertainty in the velocity model as a function of
         a fraction of the traveltime. (Default 0.1 == 10%)
-    filename : str, optional
+    save_file : str, optional
         Path to location to save pickled lookup table.
     log : bool, optional
         Toggle for logging - default is to only print information to stdout.
@@ -134,8 +149,17 @@ def compute_traveltimes(grid_spec, stations, method, phases=["P", "S"],
 
     Returns
     -------
-    lut : :class:`~quakemigrate.lut.LUT` object
-        Lookup table populated with traveltimes from the NonLinLoc files.
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
+        Lookup table populated with traveltimes.
+
+    Raises
+    ------
+    ValueError
+        If the specified `method` is not a valid option.
+    TypeError
+        If the velocity model, or constant phase velocity, is not specified.
+    NotImplementedError
+        If the `3dfmm` method is specified.
 
     """
 
@@ -144,6 +168,12 @@ def compute_traveltimes(grid_spec, stations, method, phases=["P", "S"],
     lut = LUT(**grid_spec, fraction_tt=fraction_tt)
     lut.station_data = stations
     lut.phases = phases
+
+    if method == "1dsweep":
+        warnings.warn("Parameter name has changed - continuing. To remove this"
+                      " message, change:\t'1dsweep' -> '1dnlloc'.",
+                      DeprecationWarning, 2)
+        method = "1dnlloc"
 
     if method == "homogeneous":
         logging.info("Computing homogeneous traveltimes for...")
@@ -157,7 +187,7 @@ def compute_traveltimes(grid_spec, stations, method, phases=["P", "S"],
             logging.info(f"\t...phase: {phase}...")
             _compute_homogeneous(lut, phase, velocity)
 
-    if method == "1dfmm":
+    elif method == "1dfmm":
         logging.info("Computing 1-D fast-marching traveltimes for...")
         lut.velocity_model = vmodel = kwargs.get("vmod")
         if vmodel is None:
@@ -167,19 +197,24 @@ def compute_traveltimes(grid_spec, stations, method, phases=["P", "S"],
             logging.info(f"\t...phase: {phase}...")
             _compute_1d_fmm(lut, phase, vmodel)
 
-    if method == "3dfmm":
+    elif method == "3dfmm":
         raise NotImplementedError("Feature coming soon - please contact the "
-                                  "QuakeMigrate developers")
+                                  "QuakeMigrate developers.")
 
-    if method == "1dsweep":
-        logging.info("Computing 1-D sweep traveltimes for...")
+    elif method == "1dnlloc":
+        logging.info("Computing 1-D nlloc traveltimes for...")
         lut.velocity_model = vmodel = kwargs.get("vmod")
         if vmodel is None:
             raise TypeError("Missing argument: 'vmod'")
 
         for phase in phases:
             logging.info(f"\t...phase: {phase}...")
-            _compute_1d_sweep(lut, phase, vmodel, **kwargs)
+            _compute_1d_nlloc(lut, phase, vmodel, **kwargs)
+
+    else:
+        raise ValueError(f"'{method} is not a valid method. Please consult the"
+                         "documentation. Valid options are 'homogeneous', "
+                         "'1dfmm' and '1dnlloc'.")
 
     if save_file is not None:
         lut.save(save_file)
@@ -194,7 +229,7 @@ def _compute_homogeneous(lut, phase, velocity):
 
     Parameters
     ----------
-    lut : :class:`~quakemigrate.lut.LUT` object
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
         Defines the grid on which the traveltimes are to be calculated.
     phase : str
         The seismic phase for which to calculate traveltimes.
@@ -224,7 +259,7 @@ def _compute_1d_fmm(lut, phase, vmodel):
 
     Parameters
     ----------
-    lut : :class:`~quakemigrate.lut.LUT` object
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
         Defines the grid on which the traveltimes are to be calculated.
     phase : str
         The seismic phase for which to calculate traveltimes.
@@ -233,6 +268,12 @@ def _compute_1d_fmm(lut, phase, vmodel):
         Columns:
             "Depth" of each layer in model (positive down)
             "V<phase>" velocity for each layer in model (e.g. "Vp")
+
+    Raises
+    ------
+    InvalidVelocityModelHeader
+        If the velocity model does not contain the key corresponding to the
+        specified seismic `phase`. (E.g. "Vp" for "P" phase.)
 
     """
 
@@ -293,7 +334,13 @@ def _eikonal_fmm(grid_xyz, node_spacing, velocity_grid, station_xyz):
         the input array speed has values less than or equal to zero the return
         value will be a masked array.
 
+    Raises
+    ------
+    ImportError
+        If scikit-fmm is not installed.
+
     """
+
     try:
         import skfmm
     except ImportError:
@@ -312,7 +359,7 @@ def _eikonal_fmm(grid_xyz, node_spacing, velocity_grid, station_xyz):
     return skfmm.travel_time(phi, velocity_grid, dx=node_spacing)
 
 
-def _compute_1d_sweep(lut, phase, vmodel, **kwargs):
+def _compute_1d_nlloc(lut, phase, vmodel, **kwargs):
     """
     Calculate 3-D traveltime lookup tables from a 1-D velocity model.
 
@@ -326,7 +373,7 @@ def _compute_1d_sweep(lut, phase, vmodel, **kwargs):
 
     Parameters
     ----------
-    lut : :class:`~quakemigrate.lut.LUT` object
+    lut : :class:`~quakemigrate.lut.lut.LUT` object
         Defines the grid on which the traveltimes are to be calculated.
     phase : str
         The seismic phase for which to calculate traveltimes.
@@ -346,7 +393,15 @@ def _compute_1d_sweep(lut, phase, vmodel, **kwargs):
             velocity blocks or a linear gradient (default: False).
         retain_nll_grids : bool, optional
             Toggle to choose whether to keep the 2-D traveltime grids created
-            by NonLinLoc (default: False).
+            by NonLinLoc Grid2Time (default: False).
+
+    Raises
+    ------
+    FileNotFoundError
+        If the Vel2Grid and/or Grid2Time executables are not found in the
+        `nlloc_path`.
+    Exception
+        If the execution of `Grid2Time` or `Vel2Grid` returns an error.
 
     """
 
@@ -378,7 +433,7 @@ def _compute_1d_sweep(lut, phase, vmodel, **kwargs):
     (cwd / "model").mkdir(exist_ok=True)
 
     for i, station in enumerate(lut.station_data["Name"].values):
-        logging.info(f"\t\t...running NonLinLoc - station: {station:5s} - "
+        logging.info(f"\t\t...running Grid2Time - station: {station:5s} - "
                      f"{i+1} of {stations_xyz.shape[0]}")
 
         dx, dy = [grid_xyz[j] - stations_xyz[i, j] for j in range(2)]
@@ -499,18 +554,18 @@ def _read_nlloc(fname, ignore_proj=False):
     fname : str
         Path to file containing NonLinLoc traveltime lookup tables, without
         the extension.
-    ignore_proj : bool (optional)
-        Flag to suppress the "No projection specified message".
+    ignore_proj : bool, optional
+        Flag to suppress the "No projection specified" message.
 
     Returns
     -------
-    traveltimes : array-like
-        Traveltimes for the station.
-    transform : array of `pyproj.Proj` objects
-        Array containing the grid and coordinate projections, respectively.
     gridspec : array-like
         Details on the NonLinLoc grid specification. Contains the number of
         nodes, the grid origin and the node spacings.
+    transform : array of `pyproj.Proj` objects
+        Array containing the grid and coordinate projections, respectively.
+    traveltimes : array-like
+        Traveltimes for the station.
 
     """
 
@@ -697,7 +752,7 @@ def _vmodel_string(vmodel, block_model, phase):
 
 def _velocity_gradient(i, vmodel, phase):
     """
-    Calculate the gradient of the velocity model between two layers.
+    Calculate the linear gradient of the velocity model between two layers.
 
     Parameters
     ----------
@@ -714,7 +769,7 @@ def _velocity_gradient(i, vmodel, phase):
     Returns
     -------
     dvdx : float
-        Velocity gradients for the block model.
+        Velocity gradients for the linear gradient model.
 
     """
 

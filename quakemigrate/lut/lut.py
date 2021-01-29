@@ -3,7 +3,7 @@
 Module to produce traveltime lookup tables defined on a Cartesian grid.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -16,6 +16,7 @@ import pickle
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pyproj
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 from scipy.interpolate import RegularGridInterpolator
@@ -118,7 +119,7 @@ class Grid3D:
 
         Returns
         -------
-        grid : Grid3D object (optional)
+        grid : :class:`~quakemigrate.lut.lut.Grid3D` object (optional)
             Returns a Grid3D object with decimated traveltime lookup tables.
 
         """
@@ -402,13 +403,12 @@ class LUT(Grid3D):
     A lookup table (LUT) object is a simple data structure that is used to
     store a series of regularised tables that, for each seismic station in a
     network, store the traveltimes to every point in the 3-D volume. These
-    lookup tables are pre-computed to reduce the computational cost of the
-    back-projection method.
+    lookup tables are pre-computed to efficiently carry out the migration.
 
     This class provides utility functions that can be used to serve up or query
     these pre-computed lookup tables.
 
-    This object is-a Grid3D.
+    This object is-a :class:`~quakemigrate.lut.lut.Grid3D`.
 
     Attributes
     ----------
@@ -432,7 +432,7 @@ class LUT(Grid3D):
                     - "<PHASE>"
                     - "<PHASE>"
                 etc
-    velocity_model : `~pandas.DataFrame` object
+    velocity_model : `pandas.DataFrame` object
         Contains the input velocity model specification.
 
     Methods
@@ -448,7 +448,7 @@ class LUT(Grid3D):
         Restore the state of the saved LUT object from a pickle file.
     plot(fig, gs, slices=None, hypocentre=None, station_clr="k")
         Plot cross-sections of the LUT with station locations. Optionally plot
-        slices through a coalescence volume.
+        slices through a coalescence image.
 
     """
 
@@ -466,6 +466,8 @@ class LUT(Grid3D):
             self.phases = ["P", "S"]  # Handle old lookup tables
             if lut_file is not None:
                 self.load(lut_file)
+
+        self.station_data = pd.DataFrame()
 
     def __str__(self):
         """Return short summary string of the lookup table object."""
@@ -490,7 +492,7 @@ class LUT(Grid3D):
 
         return out
 
-    def serve_traveltimes(self, sampling_rate):
+    def serve_traveltimes(self, sampling_rate, availability=None):
         """
         Serve up the traveltime lookup tables.
 
@@ -501,6 +503,9 @@ class LUT(Grid3D):
         ----------
         sampling_rate : int
             Samples per second used in the scan run.
+        availability : dict, optional
+            Dict of stations and phases for which to serve traveltime lookup
+            tables: keys "station_phase".
 
         Returns
         -------
@@ -510,11 +515,22 @@ class LUT(Grid3D):
 
         """
 
-        traveltimes = self._serve_traveltimes(self.phases)
-
+        if availability is None:
+            # Serve all
+            traveltimes = self._serve_traveltimes(self.phases)
+        else:
+            traveltimes = []
+            for key, available in availability.items():
+                station, phase = key.split("_")
+                if available == 1:
+                    try:
+                        traveltimes.append(self[station][phase])
+                    except KeyError:
+                        traveltimes.append(self[station][f"TIME_{phase}"])
+            traveltimes = np.stack(traveltimes, axis=-1)
         return np.rint(traveltimes * sampling_rate).astype(np.int32)
 
-    def traveltime_to(self, phase, ijk):
+    def traveltime_to(self, phase, ijk, station=None):
         """
         Serve up the traveltimes to a grid location for a particular phase.
 
@@ -524,6 +540,10 @@ class LUT(Grid3D):
             The seismic phase to lookup.
         ijk : array-like
             Grid indices for which to serve traveltime.
+        station : str or list-like (of str), optional
+            Station or stations for which to serve traveltimes. Can be str
+            (for a single station) or list / `pandas.Series` object for
+            multiple.
 
         Returns
         -------
@@ -534,7 +554,12 @@ class LUT(Grid3D):
 
         grid = tuple([np.arange(nc) for nc in self.node_count])
 
-        traveltimes = self._serve_traveltimes([phase])
+        if station is None:
+            traveltimes = self._serve_traveltimes([phase])
+        elif isinstance(station, str):
+            traveltimes = self._serve_traveltimes([phase], [station])
+        else:
+            traveltimes = self._serve_traveltimes([phase], station)
 
         interpolator = RegularGridInterpolator(grid, traveltimes,
                                                bounds_error=False,
@@ -542,12 +567,31 @@ class LUT(Grid3D):
 
         return interpolator(ijk)[0]
 
-    def _serve_traveltimes(self, phases):
-        """Utility function to serve up traveltimes for a list of phases."""
+    def _serve_traveltimes(self, phases, stations=None):
+        """
+        Utility function to serve up traveltimes for a list of phases.
+
+        Parameters
+        ----------
+        phases : list of str
+            List of phases for which to serve traveltime lookup tables.
+        stations : list-like of str, optional
+            List of stations for which to serve traveltime lookup tables.
+
+        Returns
+        -------
+        traveltimes : `numpy.ndarray` of float
+            Array of stacked traveltimes, per the requested phases and
+            stations.
+
+        """
+
+        stations = (self.station_data["Name"].values
+                    if stations is None else stations)
 
         traveltimes = []
         for phase in phases:
-            for station in self.station_data["Name"].values:
+            for station in stations:
                 try:
                     traveltimes.append(self[station][phase])
                 except KeyError:
@@ -596,22 +640,26 @@ class LUT(Grid3D):
                   "your lookup table to the new-style\nusing "
                   "`quakemigrate.lut.update_lut`.")
 
-    def plot(self, fig, gs, slices=None, hypocentre=None, station_clr="k"):
+    def plot(self, fig, gs, slices=None, hypocentre=None, station_clr="k",
+             station_list=None):
         """
         Plot the lookup table for a particular station.
 
         Parameters
         ----------
-        fig : `~matplotlib.Figure` object
+        fig : `matplotlib.Figure` object
             Canvas on which LUT is plotted.
         gs : tuple(int, int)
             Grid specification for the plot.
         slices : array of arrays, optional
-            Slices through a coalescence volume to plot.
+            Slices through a coalescence image to plot.
         hypocentre : array of floats
             Event hypocentre - will add cross-hair to plot.
         station_clr : str, optional
             Plot the stations with a particular colour.
+        station_list : list-like of str, optional
+            List of stations from the LUT to plot - useful if only a subset
+            have been selected to be used in e.g. locate.
 
         """
 
@@ -667,16 +715,21 @@ class LUT(Grid3D):
                              fontsize=14)
 
         # --- Plot stations ---
-        xy.scatter(self.station_data.Longitude.values,
-                   self.station_data.Latitude.values,
+        if station_list is not None:
+            station_data = \
+                self.station_data[self.station_data["Name"].isin(station_list)]
+        else:
+            station_data = self.station_data
+        xy.scatter(station_data.Longitude.values,
+                   station_data.Latitude.values,
                    s=15, marker="^", zorder=20, c=station_clr)
-        xz.scatter(self.station_data.Longitude.values,
-                   self.station_data.Elevation.values,
+        xz.scatter(station_data.Longitude.values,
+                   station_data.Elevation.values,
                    s=15, marker="^", zorder=20, c=station_clr)
-        yz.scatter(self.station_data.Elevation.values,
-                   self.station_data.Latitude.values,
+        yz.scatter(station_data.Elevation.values,
+                   station_data.Latitude.values,
                    s=15, marker="<", zorder=20, c=station_clr)
-        for i, row in self.station_data.iterrows():
+        for i, row in station_data.iterrows():
             xy.annotate(row["Name"], [row.Longitude, row.Latitude], zorder=20,
                         c=station_clr, clip_on=True)
 
@@ -760,7 +813,7 @@ class LUT(Grid3D):
 
         Parameters
         ----------
-        other : :class:`~quakemigrate.lut.LUT` object
+        other : :class:`~quakemigrate.lut.lut.LUT` object
             LUT with traveltime lookup tables to add to self.
 
         """
@@ -784,7 +837,7 @@ class LUT(Grid3D):
 
         Parameters
         ----------
-        other : :class:`~quakemigrate.lut.LUT` object
+        other : :class:`~quakemigrate.lut.lut.LUT` object
             LUT with which to test equality with self.
 
         """

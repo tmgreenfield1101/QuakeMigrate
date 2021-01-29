@@ -1,11 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Trigger stage for the Rutford icequake example.
+This script runs the trigger stage for the Rutford icequake example.
 
 """
 
+# Stop numpy using all available threads (these environment variables must be
+# set before numpy is imported for the first time).
+import os
+os.environ.update(OMP_NUM_THREADS="1",
+                  OPENBLAS_NUM_THREADS="1",
+                  NUMEXPR_NUM_THREADS="1",
+                  MKL_NUM_THREADS="1")
+
+from quakemigrate import Trigger
 from quakemigrate.io import read_lut
-from quakemigrate.signal import Trigger
 
 # --- i/o paths ---
 lut_file = "./outputs/lut/icequake.LUT"
@@ -14,7 +22,7 @@ run_name = "icequake_example"
 
 # --- Set time period over which to run trigger ---
 starttime = "2009-01-21T04:00:05.0"
-endtime = "2009-01-21T04:00:15.0"
+endtime = "2009-01-21T04:00:10.0"
 
 # --- Load the LUT ---
 lut = read_lut(lut_file=lut_file)
@@ -40,4 +48,4 @@ trig.static_threshold = 2.75
 # trig.mad_multiplier = 8.
 
 # --- Run trigger ---
-trig.trigger(starttime, endtime, savefig=False)
+trig.trigger(starttime, endtime, interactive_plot=False)

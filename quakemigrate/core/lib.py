@@ -3,7 +3,7 @@
 Bindings for the C library functions, migrate and find_max_coa.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -38,10 +38,10 @@ def migrate(onsets, traveltimes, first_idx, last_idx, available, threads):
     Parameters
     ----------
     onsets : `numpy.ndarry` of float
-        Onset functions for each seismic phase, shape(nstations, nsamples).
+        Onset functions for each seismic phase, shape(nonsets, nsamples).
     traveltimes : `numpy.ndarry` of int
-        Grids of seismic phase traveltimes converted to an integer multiple of
-        the sampling rate, shape(nx, ny, nz, nstations).
+        Grids of seismic phase traveltimes, converted to an integer multiple of
+        the sampling rate, shape(nx, ny, nz, nonsets).
     first_idx : int
         Index of first sample in array from which to scan.
     last_idx : int

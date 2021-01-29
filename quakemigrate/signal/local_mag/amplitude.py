@@ -4,7 +4,7 @@ Module containing methods to measure Wood-Anderson corrected waveform
 amplitudes to be used for local magnitude calculation.
 
 :copyright:
-    2020, QuakeMigrate developers.
+    2020 - 2021, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -17,7 +17,7 @@ import numpy as np
 from obspy import UTCDateTime
 from obspy.geodetics.base import gps2dist_azimuth
 import pandas as pd
-from scipy.signal import find_peaks, iirfilter, sosfreqz
+from scipy.signal import find_peaks, iirfilter, sosfreqz, hilbert
 
 import quakemigrate.util as util
 
@@ -49,11 +49,6 @@ class Amplitude:
 
     Attributes
     ----------
-    pre_filt : tuple of floats
-        Pre-filter to apply during the instrument response removal. E.g.
-        (0.03, 0.05, 30., 35.) - all in Hz. (Default None)
-    water_level : float
-        Water level to use in instrument response removal. (Default 60.)
     signal_window : float
         Length of S-wave signal window, in addition to the time window
         associated with the marginal_window and traveltime uncertainty.
@@ -61,16 +56,12 @@ class Amplitude:
     noise_window : float
         Length of the time window before the P-wave signal window in which
         to measure the noise amplitude. (Default 5 s)
-    noise_measure : {"RMS", "STD"}
-        Method by which to measure the noise amplitude; root-mean-quare or
-        standard deviation of the signal. (Default "RMS")
+    noise_measure : {"RMS", "STD", "ENV"}
+        Method by which to measure the noise amplitude; root-mean-quare,
+        standard deviation or average amplitude of the envelope of the signal.
+        (Default "RMS")
     loc_method : {"spline", "gaussian", "covariance"}
         Which event location estimate to use. (Default "spline")
-    remove_full_response : bool
-        Whether to remove the full response (including the effect of
-        digital FIR filters) or just the instrument transform function (as
-        defined by the PolesZeros Response Stage). Significantly slower.
-        (Default False)
     highpass_filter : bool
         Whether to apply a high-pass filter before measuring amplitudes.
         (Default False)
@@ -101,9 +92,12 @@ class Amplitude:
     Raises
     ------
     AttributeError
-        If both highpass_filter and bandpass_filter are selected, or if the
+        If both `highpass_filter` and `bandpass_filter` are selected, or if the
         user selects to apply a filter but does not provide the relevant
         frequencies.
+    AttributeError
+        If response removal parameters are provided here instead of to the
+        :class:`~quakemigrate.io.data.Archive` object.
 
     """
 
@@ -147,15 +141,17 @@ class Amplitude:
                    "Please choose one or the other.")
             raise AttributeError(msg)
 
-        # Response removal parameters
-        if "water_level" not in amplitude_params.keys():
-            msg = ("Warning: 'water level' for instrument correction not "
-                   "specified. Set to default: 60")
-            logging.warning(msg)
-        self.water_level = amplitude_params.get("water_level", 60.)
-        self.pre_filt = amplitude_params.get("pre_filt")
-        self.remove_full_response = \
-            amplitude_params.get("remove_full_response", False)
+        # Handle deprecated response removal parameters
+        if any(param in amplitude_params.keys() for param in \
+            ["water_level", "pre_filt", "remove_full_response"]):
+            raise AttributeError("The response removal parameters "
+                                 "('water_level', 'pre_filt', "
+                                 "'remove_full_response') have been moved to "
+                                 "the Archive object. Please specify them "
+                                 "there as e.g. 'archive.water_level = 60.' or"
+                                 " by providing a dictionary of "
+                                 "response_removal parameters - see the "
+                                 "template locate script for guidance.")
 
     def __str__(self):
         """Return short summary string of the Amplitude object."""
@@ -177,12 +173,6 @@ class Amplitude:
                     f"\t\t    Lowcut frequency  = {self.bandpass_lowcut} Hz\n"
                     f"\t\t    Highcut frequency = {self.bandpass_highcut} Hz\n"
                     f"\t\t    Filter corners    = {self.filter_corners}\n")
-        out += ("\t    Response removal parameters:\n"
-                f"\t\tWater level  = {self.water_level}\n")
-        if self.pre_filt is not None:
-            out += f"\t\tPre-filter   = {self.pre_filt} Hz\n"
-        out += ("\t\tRemove full response (inc. FIR stages) = "
-                f"{self.remove_full_response}\n")
 
         return out
 
@@ -193,10 +183,10 @@ class Amplitude:
 
         Parameters
         ----------
-        event : :class:`~quakemigrate.io.Event` object
-            Light class encapsulating waveform data, onset, pick and location
-            information for a given event.
-        lut : :class:`~quakemigrate.lut.LUT` object
+        event : :class:`~quakemigrate.io.event.Event` object
+            Light class encapsulating waveforms, coalescence information, picks
+            and location information for a given event.
+        lut : :class:`~quakemigrate.lut.lut.LUT` object
             Contains the traveltime lookup tables for seismic phases, computed
             for some pre-defined velocity model.
 
@@ -204,7 +194,7 @@ class Amplitude:
         -------
         amplitudes : `pandas.DataFrame` object
             P- and S-wave amplitude measurements for each component of each
-            station in the station file.
+            station in the look-up table.
             Columns:
                 epi_dist : float
                     Epicentral distance between the station and the event
@@ -214,23 +204,37 @@ class Amplitude:
                     hypocentre.
                 P_amp : float
                     Half maximum peak-to-trough amplitude in the P signal
-                    window. In *millimetres*.
+                    window. In *millimetres*. Corrected for filter gain, if
+                    applicable.
                 P_freq : float
                     Approximate frequency of the maximum amplitude P-wave
-                    signal. Calculated from the peak-to-trough time of the max
-                    peak-to-trough amplitude.
+                    signal. Calculated from the peak-to-trough time interval of
+                    the max peak-to-trough amplitude.
                 P_time : `obspy.UTCDateTime` object
                     Approximate time of amplitude observation (halfway between
                     peak and trough times).
+                P_avg_amp : float
+                    Average amplitude in the P signal window, measured by the
+                    same method as the Noise_amp (see `noise_measure`) and
+                    corrected for the same filter gain as `P_amp`. In
+                    *millimetres*.
+                P_filter_gain : float or NaN
+                    Filter gain at `P_freq` - which has been corrected for in
+                    the P_amp measurements - if a filter was applied prior to
+                    amplitude measurement; Else NaN.
                 S_amp : float
                     As for P, but in the S wave signal window.
                 S_freq : float
                     As for P.
                 S_time : `obspy.UTCDateTime` object
                     As for P.
+                S_avg_amp : float
+                    As for P.
+                S_filter_gain : float or NaN.
+                    As for P.
                 Noise_amp : float
-                    An estimate of the signal amplitude in the noise window. In
-                    millimetres.
+                    The average signal amplitude in the noise window. In
+                    *millimetres*. See `noise_measure` parameter.
                 is_picked : bool
                     Whether at least one of the phase arrivals was picked by
                     the autopicker.
@@ -238,29 +242,39 @@ class Amplitude:
 
         """
 
+        # Initialise amplitudes DataFrame
+        amplitudes = pd.DataFrame(columns=["id", "epi_dist", "z_dist",
+                                           "P_amp", "P_freq", "P_time",
+                                           "P_avg_amp", "P_filter_gain",
+                                           "S_amp", "S_freq", "S_time",
+                                           "S_avg_amp", "S_filter_gain",
+                                           "Noise_amp", "is_picked"])
+
         # Get event hypocentre location
         ev_loc = event.get_hypocentre(self.loc_method)
-
-        # Get start of earliest possible noise window and end of latest
-        # possible signal window
-        max_tt = lut.max_traveltime
-        tr_start = event.otime - event.marginal_window - self.noise_window
-        tr_end = event.otime + event.marginal_window + \
-            (1. + lut.fraction_tt) * max_tt + self.signal_window
 
         # Get traveltimes for all stations and phases: much quicker than
         # doing this multiple times in the loop
         event_ijk = lut.index2coord(ev_loc, inverse=True)[0]
-        p_ttimes = lut.traveltime_to("P", event_ijk)
-        s_ttimes = lut.traveltime_to("S", event_ijk)
+        try:
+            p_ttimes = lut.traveltime_to("P", event_ijk)
+            s_ttimes = lut.traveltime_to("S", event_ijk)
+        except KeyError:
+            msg = ("Both P and S traveltimes are required to measure phase "
+                   "amplitudes for local magnitude calculation. Please create "
+                   "a new lookup table with phases=['P', 'S']")
+            raise util.LUTPhasesException(msg)
 
-        # Initialise amplitudes DataFrame
-        amplitudes = pd.DataFrame(columns=["id", "epi_dist", "z_dist",
-                                           "P_amp", "P_freq", "P_time",
-                                           "S_amp", "S_freq", "S_time",
-                                           "Noise_amp", "is_picked"])
+        # Get start of earliest possible noise window and end of latest
+        # possible signal window
+        max_tt = lut.max_traveltime
+        pre_pad, post_pad = self.pad(event.marginal_window, max_tt,
+                                     lut.fraction_tt)
+        tr_start = event.otime - pre_pad
+        tr_end = event.otime + post_pad
+        logging.debug(f"{tr_start}, {tr_end}, {event.otime}")
 
-        # Loop through stations, calculating amplitude info
+        # Loop through stations in LUT, calculating amplitude info
         for i, station_data in lut.station_data.iterrows():
             station = station_data["Name"]
 
@@ -268,15 +282,19 @@ class Amplitude:
                                                    lut.unit_conversion_factor)
 
             # Columns: tr_id, epicentral distance, vertical distance, P_amp,
-            #          P_freq, P_time, S_amp, S_freq, S_time, Noise_amp,
-            #          picked
+            #          P_freq, P_time, P_noise_ratio, S_amp, S_freq, S_time,
+            #          S_noise_ratio, Noise_amp, picked
             amps_template = ["", epi_dist, z_dist, np.nan, np.nan, np.nan,
-                             np.nan, np.nan, np.nan, np.nan, False]
+                             np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
+                             np.nan, np.nan, False]
 
-            # Read in raw waveforms
-            st = event.data.raw_waveforms.select(station=station)
+            # Read in raw waveforms -- work on a copy!!
+            st = event.data.raw_waveforms.select(station=station).copy()
+            # Trim to padding window to ensure taper does not encroach on the
+            # noise or signal window.
+            st.trim(starttime=tr_start, endtime=tr_end)
 
-            for j, comp in enumerate(["E", "N", "Z"]): # NOTE: Will not work with 1, 2 (etc.)
+            for j, comp in enumerate(["[E,2]", "[N,1]", "Z"]):
                 amps = amps_template.copy()
                 tr = st.select(component=comp)
                 # if trace is empty (no traces) or there is more than 1 (gaps),
@@ -295,10 +313,7 @@ class Amplitude:
 
                 # Do response removal
                 try:
-                    tr = event.data.get_wa_waveform(tr, self.water_level,
-                        self.pre_filt,
-                        remove_full_response=self.remove_full_response,
-                        velocity=False)
+                    tr = event.data.get_wa_waveform(tr, velocity=False)
                 except (util.ResponseNotFoundError,
                         util.ResponseRemovalError) as e:
                     logging.warning(e)
@@ -310,20 +325,22 @@ class Amplitude:
                 else:
                     filter_sos = None
 
-                windows, picked = self._get_amplitude_windows(station, i,
-                                                              event, p_ttimes,
-                                                              s_ttimes,
-                                                              lut.fraction_tt)
+                try:
+                    windows, picked = self._get_amplitude_windows(
+                        station, i, event, p_ttimes, s_ttimes, lut.fraction_tt)
+                    amps[14] = picked
+                except util.PickOrderException as e:
+                    logging.warning(f"{e}")
+                    amplitudes.loc[i*3+j] = amps
+                    continue
 
-                amps, filter_gain = self._measure_signal_amps(amps, tr,
-                                                              windows,
-                                                              filter_sos)
+                amps = self._measure_signal_amps(amps, tr, windows,
+                                                 self.noise_measure,
+                                                 filter_sos)
 
-                noise_amp = self._measure_noise_amp(tr, windows, filter_gain,
-                                                    method=self.noise_measure)
-
-                # Put in relevant columns; noise amp in *millimetres*
-                amps[9:11] = noise_amp, picked
+                noise_amp = self._measure_noise_amp(tr, windows,
+                                                    self.noise_measure)
+                amps[13] = noise_amp
 
                 # 3 rows per station; one for each component
                 amplitudes.loc[i*3+j] = amps
@@ -373,7 +390,7 @@ class Amplitude:
         # Evaulate vertical distance between station and event. Convert to
         # kilometres.
         km_cf = 1000 / unit_conversion_factor
-        z_dist = (evdp - stel) / km_cf
+        z_dist = (evdp - stel) / km_cf  # NOTE: stel is actually depth.
 
         return epi_dist, z_dist
 
@@ -389,7 +406,7 @@ class Amplitude:
 
         Returns
         -------
-        filter_sos : ndarray
+        filter_sos : `numpy.ndarray`
             Second-order sections representation of the applied filter.
 
         """
@@ -400,7 +417,7 @@ class Amplitude:
             try:
                 filter_sos = self._bandpass_filter(tr)
             except util.NyquistException as e:
-                logging.warning(f"\t{e}Applying a high-pass filter instead...")
+                logging.warning(f"\t{e} Applying a high-pass filter instead..")
                 filter_sos = self._highpass_filter(tr)
         else:
             filter_sos = self._highpass_filter(tr)
@@ -419,7 +436,7 @@ class Amplitude:
 
         Returns
         -------
-        filter_sos : ndarray
+        filter_sos : `numpy.ndarray`
             Second-order sections representation of the applied filter.
 
         Raises
@@ -467,7 +484,7 @@ class Amplitude:
 
         Returns
         -------
-        filter_sos : ndarray
+        filter_sos : `numpy.ndarray`
             Second-order sections representation of the applied filter.
 
         """
@@ -520,7 +537,7 @@ class Amplitude:
             Station name.
         i : int
             Iterator variable.
-        event : :class:`~quakemigrate.io.Event` object
+        event : :class:`~quakemigrate.io.event.Event` object
             Light class encapsulating signal, onset, pick and location
             information for a given event.
         p_ttimes : array-like
@@ -545,7 +562,25 @@ class Amplitude:
 
         """
 
-        p_pick, s_pick, picked = self._get_picks(i, event)
+        p_pick, s_pick, picked = self._get_picks(station, event)
+
+        for pick, phase in [[p_pick, "P"], [s_pick, "S"]]:
+            if not isinstance(pick, UTCDateTime):
+                if pick == "-1":
+                    if phase == "P":
+                        p_pick = event.otime + p_ttimes[i]
+                    else:
+                        s_pick = event.otime + s_ttimes[i]
+                # If there was no onset available for one phase, the pick for
+                # the other may not have been checked to ensure it was made
+                # before/after the modelled arrival time for the other phase.
+                # So use modelled arrival time for both phases.
+                elif pick == f"No {phase} onset":
+                    logging.debug(f"No onset available when picking {phase} on "
+                                  f"{station}. Using modelled arrival times.")
+                    p_pick = event.otime + p_ttimes[i]
+                    s_pick = event.otime + s_ttimes[i]
+                    break
 
         # Check p_pick is before s_pick
         try:
@@ -561,66 +596,75 @@ class Amplitude:
         s_end = s_pick + event.marginal_window + s_ttimes[i] * fraction_tt + \
             self.signal_window
 
+        # Check for overlaps
         if s_start < p_end:
-            if p_end < s_pick:
-                windows = [[p_start, p_end],
-                           [p_end, s_end]]
-            else:
-                windows = [[p_start, s_pick - event.marginal_window / 2],
-                           [s_pick - event.marginal_window / 2, s_end]]
-        else:
+            mid_time = p_end + (s_start - p_end) / 2
+            windows = [[p_start, mid_time],
+                       [mid_time, s_end]]
+        elif s_start - p_end < self.signal_window:
             windows = [[p_start, s_start],
+                       [s_start, s_end]]
+        else:
+            windows = [[p_start, p_end + self.signal_window],
                        [s_start, s_end]]
 
         return windows, picked
 
-    def _get_picks(self, i, event):
+    def _get_picks(self, station, event):
         """
-        Get picks from this station for this event. Phase picks are preferred,
-        but modelled times according to the event location and travel-time
-        look-up table are used if no automatic pick was made.
+        Get picks from this station for this event. If no phase pick is
+        found, -1 is returned. If no picks at all are found, "No <phase> onset"
+        is returned.
 
         Parameters
         ----------
-        i : int
-            Iterator variable.
-        event : :class:`~quakemigrate.io.Event` object
-            Light class encapsulating signal, onset, pick and location
-            information for a given event.
+        station : str
+            Station name.
+        event : :class:`~quakemigrate.io.event.Event` object
+            Light class encapsulating waveforms, coalescence information, picks
+            and location information for a given event.
 
         Returns
         -------
-        p_pick : `obspy.UTCDateTime` object
-            P pick time. Autopick time if available, otherwise ModelledTime
-            calculated by the autopicker.
-        s_pick : `obspy.UTCDateTime` object
-            S pick time. Autopick time if available, otherwise ModelledTime
-            calculated by the autpicker.
+        p_pick : `obspy.UTCDateTime` object, "-1" or "No_P_onset"
+            P pick time. Autopick time if available, otherwise -1. If no onset
+            function was available to the autopicker, "No_<phase>_onset" is
+            returned.
+        s_pick : `obspy.UTCDateTime` object, "-1" or "No_S_onset"
+            As for P.
         picked : bool
-            Whether at least one of the phases was picked by the autopicker.
+            Whether at least one phase was picked by the auto-picker.
 
         """
 
         picks = event.picks["df"]
-        p_pick = picks.iloc[i*2]["PickTime"]
-        s_pick = picks.iloc[i*2+1]["PickTime"]
+        picks = picks.loc[picks["Station"] == station]
+        picked = False
 
-        picked = True
-        # If neither P nor S is picked, picked=False
-        if p_pick == -1 and s_pick == -1:
-            picked = False
-        if p_pick == -1:
-            p_pick = picks.iloc[i*2]["ModelledTime"]
-        if s_pick == -1:
-            s_pick = picks.iloc[i*2+1]["ModelledTime"]
-
-        # Convert to UTCDateTime objects
-        p_pick = UTCDateTime(p_pick)
-        s_pick = UTCDateTime(s_pick)
+        if len(picks) > 0:
+            try:
+                p_pick = picks.loc[picks["Phase"] == "P"]["PickTime"].iloc[0]
+                p_pick = UTCDateTime(str(p_pick))
+                picked = True
+            except IndexError:
+                p_pick = "No P onset"
+            except ValueError:  # UTCDateTime("-1") -> ValueError
+                p_pick = "-1"
+            try:
+                s_pick = picks.loc[picks["Phase"] == "S"]["PickTime"].iloc[0]
+                s_pick = UTCDateTime(str(s_pick))
+                picked = True
+            except IndexError:
+                s_pick = "No S onset"
+            except ValueError:  # UTCDateTime("-1") -> ValueError
+                s_pick = "-1"
+        else:
+            p_pick = s_pick = "-1"
 
         return p_pick, s_pick, picked
 
-    def _measure_signal_amps(self, amps, tr, windows, filter_sos=None):
+    def _measure_signal_amps(self, amps, tr, windows, method="RMS",
+                             filter_sos=None):
         """
         Loop through the windows and measure the maximum half peak-to-peak
         amplitude, the approximate frequency (derived from the p2p time) and
@@ -629,21 +673,28 @@ class Amplitude:
         Performs a linear detrend across the window before measuring
         amplitudes.
 
-        NOTE: signal amplitudes are converted to *millimetres*. This may have
-        to be adjusted depending on the chosen formulation of the local
-        magnitude attenuation function.
+        NOTE: signal amplitudes are returned in *millimetres*. This may mean
+        the formulation of the local magnitude attenuation function being used
+        needs to be adjusted to match these units. All functions provided in QM
+        are in millimetres.
 
         Parameters
         ----------
         amps : list
             Amplitude information for this trace.
             Columns = ["epi_dist", "z_dist", "P_amp", "P_freq", "P_time",
-                       "S_amp", "S_freq", "S_time", "Noise_amp", "is_picked"]
+                       "P_avg_amp", "P_filter_gain", "S_amp", "S_freq",
+                       "S_time", "S_avg_amp", "S_filter_gain", "Noise_amp",
+                       "is_picked"]
         tr : `obspy.Trace` object
             Trace from which to measure amplitudes.
         windows : array-like
             [[P_window_start, P_window_end], [S_window_start, S_window_end]]
-        filter_sos : ndarray, optional
+        method : {"RMS", "STD", "ENV"}, optional
+            The method by which to measure the average amplitude in the signal
+            window: root-mean-square, standard deviation or average amplitude
+            of the envelope of the signal. (Default "RMS")
+        filter_sos : `numpy.ndarray`, optional
             Second-order sections representation of the filter applied to the
             trace (if applicable).
 
@@ -652,28 +703,40 @@ class Amplitude:
         amps : list
             Amplitude information for this trace.
             Columns = ["epi_dist", "z_dist", "P_amp", "P_freq", "P_time",
-                       "S_amp", "S_freq", "S_time", "Noise_amp", "is_picked"]
+                       "P_avg_amp", "P_filter_gain", "S_amp", "S_freq",
+                       "S_time", "S_avg_amp", "S_filter_gain", "Noise_amp",
+                       "is_picked"]
             With newly populated values:
-            P_amp : float
-                Half maximum peak-to-trough amplitude in the P signal window.
-                In *millimetres*.
-            P_freq : float
-                Approximate frequency of the maximum amplitude P-wave signal.
-                Calculated from the peak-to-trough time of the max
-                peak-to-trough amplitude.
-            P_time : `obspy.UTCDateTime` object
-                Approximate time of amplitude observation (halfway between peak
-                and trough times).
-            S_amp : float
-                As for P but in the S signal window.
-            S_freq : float
-                As for P.
-            S_time : `obspy.UTCDateTime` object
-                As for P.
-        filter_gain : float or None
-            The gain of the filter applied to the trace at the approximate
-            frequency of the S-wave p2p signal, if a filter was chosen.
-            Else None.
+                P_amp : float
+                    Half maximum peak-to-trough amplitude in the P signal
+                    window. In *millimetres*. Corrected for filter gain, if
+                    applicable.
+                P_freq : float
+                    Approximate frequency of the maximum amplitude P-wave
+                    signal. Calculated from the peak-to-trough time interval of
+                    the max peak-to-trough amplitude.
+                P_time : `obspy.UTCDateTime` object
+                    Approximate time of amplitude observation (halfway between
+                    peak and trough times).
+                P_avg_amp : float
+                    Average amplitude in the P signal window, measured by the
+                    same method as the Noise_amp (see `noise_measure`) and
+                    corrected for the same filter gain as `P_amp`. In
+                    *millimetres*.
+                P_filter_gain : float
+                    Filter gain at `P_freq`, which has been corrected for in
+                    the P_amp measurements (if a filter was applied prior to
+                    amplitude measurement).
+                S_amp : float
+                    As for P, but in the S wave signal window.
+                S_freq : float
+                    As for P.
+                S_time : `obspy.UTCDateTime` object
+                    As for P.
+                S_avg_amp : float
+                    As for P.
+                S_filter_gain : float
+                    As for P.
 
         """
 
@@ -691,7 +754,7 @@ class Amplitude:
                                 f"data for trace {window.id}")
                 continue
 
-            # Measure peak-to-peak amplitude
+            # Measure maximum half peak-to-trough amplitude
             try:
                 half_amp, approx_freq, p2t_time = \
                     self._peak_to_trough_amplitude(window)
@@ -700,23 +763,31 @@ class Amplitude:
                                 f"signal window for trace {window.id}: {e.msg}")
                 continue
 
+            # Measure average amplitude
+            average_amp = self._average_amplitude(window, method)
+
             # Correct for filter gain at approximate frequency of
             # measured amplitude
+            filter_gain = None
             if self.bandpass_filter or self.highpass_filter:
                 _, filter_gain = sosfreqz(filter_sos, worN=[approx_freq],
                                           fs=tr.stats.sampling_rate)
-                half_amp /= np.abs(filter_gain[0])
-            else:
-                filter_gain = None
-
-            # Multiply amplitude by 1000 to convert to *millimetres*
-            half_amp *= 1000.
+                filter_gain = np.abs(filter_gain[0])
+                if not filter_gain:
+                    logging.info("\t    Warning: Invalid frequency ("
+                                 f"{approx_freq:.5g} Hz) for {phase}_amp "
+                                 f"measurement on:\n\t\t{tr}")
+                    continue
+                else:
+                    half_amp /= filter_gain
+                    average_amp /= filter_gain
 
             # Put in relevant columns for P / S amplitude, approx_freq,
             # p2t_time
-            amps[3+k*3:6+k*3] = half_amp, approx_freq, p2t_time
+            amps[3+k*5:8+k*5] = (half_amp, approx_freq, p2t_time, average_amp,
+                                 filter_gain)
 
-        return amps, filter_gain
+        return amps
 
     def _peak_to_trough_amplitude(self, trace):
         """
@@ -726,18 +797,20 @@ class Amplitude:
 
         NOTE: Returns *half* the maximum peak-to-trough amplitude, as this is
         what the measurement of local magnitude is defined from.
-        NOTE: Units are nanometres; this may have to be adjusted based on the
-        chosen formulation of the local magnitude attenuation function.
+
+        NOTE: Units are *millimetres*.
 
         Parameters
         ----------
         trace : `obspy.Trace` object
-            Waveform for which to measure max peak-to-trough amplitude.
+            Waveform for which to measure max peak-to-trough amplitude
+            (corrected to displacement in units of metres).
 
         Returns
         -------
         half_amp : float
-            Half the value of maximum peak-to-trough amplitude, in nanometres.
+            Half the value of maximum peak-to-trough amplitude, *in
+            millimetres*.
             Returns -1 if no measurement could be made.
         approx_freq : float
             Approximate frequency of the arrival, based on the half-period
@@ -809,11 +882,12 @@ class Amplitude:
         approx_freq = 1. / (np.abs(peak_time - trough_time) * 2.)
 
         # Local magnitude is defined based on maximum zero-to-peak amplitude
-        half_amp = full_amp / 2
+        # in *millimetres*
+        half_amp = full_amp * 1000 / 2
 
         return half_amp, approx_freq, p2t_time
 
-    def _measure_noise_amp(self, tr, windows, filter_gain=None, method="RMS"):
+    def _measure_noise_amp(self, tr, windows, method="RMS"):
         """
         Make a measurement of the signal amplitude in a 'noise window' before
         the P signal window. Several methods for making this measurement are
@@ -822,35 +896,27 @@ class Amplitude:
         Performs a linear detrend across the window before measuring
         amplitudes.
 
-        NOTE: Returns the noise amplitude in millimetres: this may have to be
-        adjusted depending on the chosen formulation of the local magnitude
-        attenuation function.
+        NOTE: Returns the noise amplitude in millimetres: the chosen
+        formulation of the local magnitude attenuation function may have to be
+        adjusted to match these units.
 
         Parameters
         ----------
         tr : `obspy.Trace` object
-            Trace from which to measure the noise amplitude.
+            Trace from which to measure the noise amplitude (corrected to
+            displacement in units of metres).
         windows : array-like
             [[P_window_start, P_window_end], [S_window_start, S_window_end]]
-        filter_gain : float, optional
-            The gain of the filter applied to the trace at the approximate
-            frequency of the S-wave p2p signal, if a filter was chosen.
-            (Default None)
-        method : {"RMS", "STD"}, optional
+        method : {"RMS", "STD", "ENV"}, optional
             The method by which to measure the amplitude of the signal in the
-            noise window: root-mean-square, or standard deviation.
-            (Default "RMS")
+            noise window: root-mean-square, standard deviation or average
+            amplitude of the envelope of the signal. (Default "RMS")
 
         Returns
         -------
         noise_amp : float
             An estimate of the signal amplitude in the noise window. In
-            millimetres.
-
-        Raises
-        ------
-        NotImplementedError
-            For measurement methods other than {"RMS", "STD"}.
+            millimetres. Not corrected for filter gain.
 
         """
 
@@ -862,22 +928,99 @@ class Amplitude:
         noise_end = p_start
 
         noise = tr.slice(noise_start, noise_end)
-        noise.detrend("linear")
-
-        # Use standard deviation in noise window as an estimate of the
-        # background noise amplitude *in millimetres*
-        if method == "RMS":
-            noise_amp = np.sqrt(np.mean(np.square(noise.data))) * 1000.
-        elif method == "STD":
-            noise_amp = np.std(noise.data) * 1000.
+        if not bool(noise) or noise.data.max() == noise.data.min():
+            logging.warning("Noise window doesn't contain any data for trace "
+                            f"{noise.id}")
+            noise_amp = np.nan
         else:
-            raise NotImplementedError("Only 'RMS' and 'STD' are available "
-                                      "currently. Please contact the "
-                                      "QuakeMigrate developers.")
-
-        if self.bandpass_filter or self.highpass_filter:
-            # NOTE: uses the gain at the approx_freq of the last amplitude
-            # measured; S-wave signal window.
-            noise_amp /= np.abs(filter_gain[0])
+            noise.detrend("linear")
+            noise_amp = self._average_amplitude(noise, method)
 
         return noise_amp
+
+    def _average_amplitude(self, trace, method):
+        """
+        Measure the average amplitude of a trace.
+
+        NOTE: returns amplitude in *millimetres*.
+
+        Parameters
+        ----------
+        trace : `obspy.Trace` object
+            Trace from which to measure the amplitude (corrected to
+            displacement in units of metres).
+        method : {"RMS", "STD", "ENV"}
+            The method by which to measure the average amplitude of the signal:
+            root-mean-square, standard deviation or average amplitude of the
+            envelope of the signal. (Default "RMS").
+
+        Returns
+        -------
+        amp : float
+            Average amplitude of the trace (in millimetres).
+
+        Raises
+        ------
+        NotImplementedError
+            For measurement methods other than {"RMS", "STD", "ENV"}.
+
+        """
+
+        if method == "RMS":
+            amp = np.sqrt(np.mean(np.square(trace.data)))
+        elif method == "STD":
+            amp = np.std(trace.data)
+        elif method == "ENV":
+            amp = np.mean(np.abs(hilbert(trace.data)))
+        else:
+            raise NotImplementedError("Only 'RMS', 'STD' and 'ENV' are "
+                                      "available currently. Please contact the"
+                                      " QuakeMigrate developers.")
+
+        # Convert to *millimetres*
+        amp *= 1000.
+
+        return amp
+
+    def pad(self, marginal_window, max_tt, fraction_tt):
+        """
+        Calculate padding, including an allowance for the taper applied when
+        filtering / removing instrument response, to ensure the noise and
+        signal window amplitude measurements are not affected by the taper.
+
+        Parameters
+        ----------
+        marginal_window : float
+            Half-width of window centred on the maximum coalescence time of the
+            event over which the 4-D coalescence function is marginalised. Used
+            here as an estimate of the origin time uncertainity when
+            calculating the signal windows.
+        max_tt : float
+            Maximum traveltime in the look-up table.
+        fraction_tt : float
+            An estimate of the uncertainty in the velocity model as a function
+            of a fraction of the traveltime. (Default 0.1 == 10%)
+
+        Returns
+        -------
+        pre_pad : float
+            Time window by which to pre-pad the data when reading from the
+            waveform archive.
+        post_pad : float
+            Time window by which to post-pad the data when reading from the
+            waveform archive.
+
+        """
+
+        pre_pad = self.noise_window + marginal_window
+        logging.debug(f"Raw pre-pad: {pre_pad}")
+        post_pad = self.signal_window + max_tt * (1 + fraction_tt) \
+            + marginal_window
+        logging.debug(f"Raw post-pad: {post_pad}")
+
+        timespan = pre_pad + post_pad
+        pre_pad += np.ceil(timespan*0.06)
+        post_pad += np.ceil(timespan*0.06)
+        logging.debug(f"Final pre-pad: {pre_pad}, final post-pad: {post_pad}")
+
+        return pre_pad, post_pad

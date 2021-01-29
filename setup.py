@@ -28,9 +28,8 @@ if READ_THE_DOCS:
 SETUP_DIRECTORY = pathlib.Path.cwd()
 
 
-long_description = """A Python package for the detection and location of
-                      seismicity, based on waveform backprojection and
-                      stacking"""
+long_description = """A Python package for automatic earthquake detection and
+                      location using waveform migration and stacking."""
 
 
 def read(*parts):
@@ -179,10 +178,10 @@ def setup_package():
 
     if not READ_THE_DOCS:
         install_requires = ["matplotlib<3.3", "numpy", "obspy>=1.2",
-                            "pandas<1.1", "pyproj>=2.5", "scipy"]
+                            "pandas==1.0.*", "pyproj>=2.5", "scipy"]
     else:
         install_requires = ["matplotlib<3.3", "mock", "numpy", "obspy>=1.2",
-                            "pandas<1.1", "pyproj>=2.5", "scipy"]
+                            "pandas==1.0.*", "pyproj>=2.5", "scipy"]
 
     setup_args = {
         "name": "quakemigrate",
@@ -204,17 +203,21 @@ def setup_package():
             "Programming Language :: Python :: 3.7",
             "Programming Language :: Python :: 3.8",
         ],
-        "keywords": "seismic waveform event detection location",
+        "keywords": "seismic event detection location waveform migration",
         "install_requires": install_requires,
         "extras_require": get_extras_require(),
         "zip_safe": False,
         "cmdclass": {"build_ext": CustomBuildExt},
-        "packages": ["quakemigrate", "quakemigrate.core", "quakemigrate.io",
-                     "quakemigrate.export", "quakemigrate.lut",
-                     "quakemigrate.plot", "quakemigrate.signal",
+        "packages": ["quakemigrate",
+                     "quakemigrate.core",
+                     "quakemigrate.export",
+                     "quakemigrate.io",
+                     "quakemigrate.lut",
+                     "quakemigrate.plot",
+                     "quakemigrate.signal",
+                     "quakemigrate.signal.local_mag",
                      "quakemigrate.signal.onsets",
-                     "quakemigrate.signal.pickers",
-                     "quakemigrate.signal.local_mag"],
+                     "quakemigrate.signal.pickers"],
         "ext_modules": get_extensions(),
         "package_data": get_package_data(),
         "package_dir": get_package_dir()
